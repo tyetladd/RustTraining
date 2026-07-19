@@ -264,7 +264,20 @@ pub async fn create_tempfile_with_fid(db: &Db, fid: i64, dmid: i64, dkey: Option
         dmid,
         dkey,
         devids
-    )
+    )?;
+    // On Postgres `tempfile.fid` is BIGSERIAL and an explicit-id insert does NOT
+    // advance the sequence, so a later auto-fid create_tempfile would eventually
+    // collide with this row. Bump the sequence past the highest live fid.
+    if let Store::Postgres(p) = &db.store {
+        sqlx::query(
+            "SELECT setval(pg_get_serial_sequence('tempfile','fid'), \
+             GREATEST((SELECT COALESCE(MAX(fid), 0) FROM tempfile), $1))",
+        )
+        .bind(fid)
+        .execute(p)
+        .await?;
+    }
+    Ok(())
 }
 
 pub async fn tempfile_or_file_fid_exists(db: &Db, fid: i64) -> Result<bool> {
@@ -280,8 +293,17 @@ pub async fn get_tempfile(db: &Db, fid: i64) -> Result<Option<TempfileRow>> {
     q_fetch_optional!(db, "SELECT fid, dmid, dkey, classid, devids FROM tempfile WHERE fid = ?", TempfileRow, fid)
 }
 
-pub async fn delete_tempfile(db: &Db, fid: i64) -> Result<()> {
-    q_exec!(db, "DELETE FROM tempfile WHERE fid = ?", fid)
+/// Deletes the tempfile row and returns whether a row was actually removed.
+/// `create_close` uses the `true`/`false` result as a race guard: if two
+/// concurrent closes target the same fid, only the one that deletes the row
+/// proceeds to finalize; the loser sees `false` and returns `no_temp_file`.
+pub async fn delete_tempfile(db: &Db, fid: i64) -> Result<bool> {
+    let affected = match &db.store {
+        Store::Sqlite(p) => sqlx::query("DELETE FROM tempfile WHERE fid = ?").bind(fid).execute(p).await?.rows_affected(),
+        Store::MySql(p) => sqlx::query("DELETE FROM tempfile WHERE fid = ?").bind(fid).execute(p).await?.rows_affected(),
+        Store::Postgres(p) => sqlx::query("DELETE FROM tempfile WHERE fid = $1").bind(fid).execute(p).await?.rows_affected(),
+    };
+    Ok(affected > 0)
 }
 
 // ---- file / create_close ----
@@ -317,26 +339,101 @@ pub async fn insert_file(db: &Db, fid: i64, dmid: i64, dkey: &str, length: i64, 
     )
 }
 
+/// Atomically finalizes a `create_close`: within one transaction it retires any
+/// pre-existing file at the same key (overwrite), inserts the new `file` row
+/// (devcount = 1) and its `file_on` location. Doing this as a single unit means
+/// a concurrent `get_paths` never observes the key transiently missing, and a
+/// crash mid-close cannot leave a `file` row with no location (devcount 0,
+/// unreadable). Returns the retired old fid, if any, so the caller can queue its
+/// blobs for deletion outside the transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn finalize_file(
+    db: &Db,
+    fid: i64,
+    dmid: i64,
+    dkey: &str,
+    length: i64,
+    classid: i64,
+    devid: i64,
+    retire_old: Option<i64>,
+) -> Result<()> {
+    macro_rules! run_tx {
+        ($pool:expr, $ph_old:literal, $insert_file:literal, $insert_on:literal) => {{
+            let mut tx = $pool.begin().await?;
+            if let Some(old) = retire_old {
+                sqlx::query($ph_old).bind(old).execute(&mut *tx).await?;
+            }
+            sqlx::query($insert_file)
+                .bind(fid).bind(dmid).bind(dkey).bind(length).bind(classid)
+                .execute(&mut *tx).await?;
+            sqlx::query($insert_on).bind(fid).bind(devid).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }};
+    }
+    match &db.store {
+        Store::Sqlite(p) => run_tx!(
+            p,
+            "DELETE FROM file WHERE fid = ?",
+            "INSERT INTO file (fid, dmid, dkey, length, classid, devcount) VALUES (?, ?, ?, ?, ?, 1)",
+            "INSERT OR IGNORE INTO file_on (fid, devid) VALUES (?, ?)"
+        ),
+        Store::MySql(p) => run_tx!(
+            p,
+            "DELETE FROM file WHERE fid = ?",
+            "INSERT INTO file (fid, dmid, dkey, length, classid, devcount) VALUES (?, ?, ?, ?, ?, 1)",
+            "INSERT INTO file_on (fid, devid) VALUES (?, ?) ON DUPLICATE KEY UPDATE fid = fid"
+        ),
+        Store::Postgres(p) => run_tx!(
+            p,
+            "DELETE FROM file WHERE fid = $1",
+            "INSERT INTO file (fid, dmid, dkey, length, classid, devcount) VALUES ($1, $2, $3, $4, $5, 1)",
+            "INSERT INTO file_on (fid, devid) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+        ),
+    }
+    Ok(())
+}
+
 pub async fn add_file_on(db: &Db, fid: i64, devid: i64) -> Result<()> {
+    insert_file_on_ignore(db, fid, devid).await?;
+    recount_devcount(db, fid).await
+}
+
+/// Inserts a (fid, devid) row, treating an existing row as success. Uses each
+/// backend's narrow "ignore duplicate key only" form — notably NOT MySQL's
+/// `INSERT IGNORE`, which would also swallow data-conversion / out-of-range /
+/// NOT NULL errors and silently drop a genuine write failure.
+async fn insert_file_on_ignore(db: &Db, fid: i64, devid: i64) -> Result<()> {
     match &db.store {
         Store::Sqlite(p) => {
             sqlx::query("INSERT OR IGNORE INTO file_on (fid, devid) VALUES (?, ?)").bind(fid).bind(devid).execute(p).await?;
         }
         Store::MySql(p) => {
-            sqlx::query("INSERT IGNORE INTO file_on (fid, devid) VALUES (?, ?)").bind(fid).bind(devid).execute(p).await?;
+            sqlx::query("INSERT INTO file_on (fid, devid) VALUES (?, ?) ON DUPLICATE KEY UPDATE fid = fid")
+                .bind(fid).bind(devid).execute(p).await?;
         }
         Store::Postgres(p) => {
             sqlx::query("INSERT INTO file_on (fid, devid) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(fid).bind(devid).execute(p).await?;
         }
     }
-    let count: i64 = q_scalar!(db, "SELECT COUNT(*) FROM file_on WHERE fid = ?", i64, fid)?;
-    q_exec!(db, "UPDATE file SET devcount = ? WHERE fid = ?", count, fid)
+    Ok(())
+}
+
+/// Recomputes `file.devcount` from `file_on` in a single statement so that
+/// concurrent add/remove callers cannot lose each other's update (the previous
+/// read-count-then-write-literal form raced and left devcount wrong, which in
+/// turn made the replication policy over- or under-replicate).
+async fn recount_devcount(db: &Db, fid: i64) -> Result<()> {
+    q_exec!(
+        db,
+        "UPDATE file SET devcount = (SELECT COUNT(*) FROM file_on WHERE fid = ?) WHERE fid = ?",
+        fid,
+        fid
+    )
 }
 
 pub async fn remove_file_on(db: &Db, fid: i64, devid: i64) -> Result<()> {
     q_exec!(db, "DELETE FROM file_on WHERE fid = ? AND devid = ?", fid, devid)?;
-    let count: i64 = q_scalar!(db, "SELECT COUNT(*) FROM file_on WHERE fid = ?", i64, fid)?;
-    q_exec!(db, "UPDATE file SET devcount = ? WHERE fid = ?", count, fid)
+    recount_devcount(db, fid).await
 }
 
 pub async fn get_devids_for_fid(db: &Db, fid: i64) -> Result<Vec<i64>> {
@@ -376,7 +473,8 @@ pub async fn queue_replicate(db: &Db, fid: i64, fromdevid: Option<i64>) -> Resul
             sqlx::query("INSERT OR IGNORE INTO file_to_replicate (fid, fromdevid) VALUES (?, ?)").bind(fid).bind(fromdevid).execute(p).await?;
         }
         Store::MySql(p) => {
-            sqlx::query("INSERT IGNORE INTO file_to_replicate (fid, fromdevid) VALUES (?, ?)").bind(fid).bind(fromdevid).execute(p).await?;
+            sqlx::query("INSERT INTO file_to_replicate (fid, fromdevid) VALUES (?, ?) ON DUPLICATE KEY UPDATE fid = fid")
+                .bind(fid).bind(fromdevid).execute(p).await?;
         }
         Store::Postgres(p) => {
             sqlx::query("INSERT INTO file_to_replicate (fid, fromdevid) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(fid).bind(fromdevid).execute(p).await?;
@@ -406,7 +504,8 @@ pub async fn queue_delete(db: &Db, fid: i64) -> Result<()> {
             sqlx::query("INSERT OR IGNORE INTO file_to_delete (fid) VALUES (?)").bind(fid).execute(p).await?;
         }
         Store::MySql(p) => {
-            sqlx::query("INSERT IGNORE INTO file_to_delete (fid) VALUES (?)").bind(fid).execute(p).await?;
+            sqlx::query("INSERT INTO file_to_delete (fid) VALUES (?) ON DUPLICATE KEY UPDATE fid = fid")
+                .bind(fid).execute(p).await?;
         }
         Store::Postgres(p) => {
             sqlx::query("INSERT INTO file_to_delete (fid) VALUES ($1) ON CONFLICT DO NOTHING").bind(fid).execute(p).await?;
@@ -550,7 +649,7 @@ pub async fn queue_add(db: &Db, fid: i64, devid: Option<i64>, qtype: &str, arg: 
                 .bind(fid).bind(devid).bind(qtype).bind(arg).execute(p).await?;
         }
         Store::MySql(p) => {
-            sqlx::query("INSERT IGNORE INTO file_to_queue (fid, devid, type, arg) VALUES (?, ?, ?, ?)")
+            sqlx::query("INSERT INTO file_to_queue (fid, devid, type, arg) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE fid = fid")
                 .bind(fid).bind(devid).bind(qtype).bind(arg).execute(p).await?;
         }
         Store::Postgres(p) => {

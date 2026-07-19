@@ -19,10 +19,13 @@ pub async fn run_monitor(state: Arc<AppState>) {
             if std::fs::create_dir_all(&dir).is_err() {
                 continue;
             }
-            let total_kb = fs4::total_space(&dir).unwrap_or(0) / 1024;
-            let avail_kb = fs4::available_space(&dir).unwrap_or(0) / 1024;
-            let used_kb = total_kb.saturating_sub(avail_kb);
-            let _ = queries::update_device_usage(db, d.devid, total_kb as i64, used_kb as i64).await;
+            // Store megabytes: the columns are named mb_total/mb_used and the
+            // reference tracker records MB (it divides the storage node's
+            // KB-reported usage by 1024). Dividing bytes by 1024*1024 gives MB.
+            let total_mb = (fs4::total_space(&dir).unwrap_or(0) / (1024 * 1024)) as i64;
+            let avail_mb = (fs4::available_space(&dir).unwrap_or(0) / (1024 * 1024)) as i64;
+            let used_mb = total_mb.saturating_sub(avail_mb);
+            let _ = queries::update_device_usage(db, d.devid, total_mb, used_mb).await;
         }
     }
 }
@@ -156,23 +159,10 @@ pub async fn run_fsck(state: Arc<AppState>) {
                 if let Some(&devid) = live.first() {
                     let path = storepath::fs_path(&state.cfg.docroot, devid, f.fid);
                     if let Ok(data) = std::fs::read(&path) {
-                        let computed = match alg.to_ascii_uppercase().as_str() {
-                            "MD5" => {
-                                use md5::{Digest, Md5};
-                                let mut h = Md5::new();
-                                h.update(&data);
-                                hex::encode(h.finalize())
+                        if let Some(computed) = crate::util::compute_checksum_hex(&alg, &data) {
+                            if !computed.eq_ignore_ascii_case(&hexval) {
+                                let _ = queries::fsck_log(db, f.fid, "checksum_mismatch", Some(devid)).await;
                             }
-                            "SHA1" => {
-                                use sha1::{Digest, Sha1};
-                                let mut h = Sha1::new();
-                                h.update(&data);
-                                hex::encode(h.finalize())
-                            }
-                            _ => String::new(),
-                        };
-                        if !computed.is_empty() && !computed.eq_ignore_ascii_case(&hexval) {
-                            let _ = queries::fsck_log(db, f.fid, "checksum_mismatch", Some(devid)).await;
                         }
                     }
                 }
@@ -226,12 +216,20 @@ pub async fn run_rebalance(state: Arc<AppState>) {
                     if let Some(parent) = dst_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if std::fs::copy(&src_path, &dst_path).is_ok() {
-                        let _ = queries::add_file_on(db, entry.fid, dst_devid).await;
+                    // Only drop the source copy once the destination copy is
+                    // both on disk AND recorded. If add_file_on fails, leave the
+                    // source intact — otherwise a fid whose only replica was on
+                    // src would end up tracked on neither device (lost file)
+                    // even though the bytes exist on dst.
+                    if std::fs::copy(&src_path, &dst_path).is_ok()
+                        && queries::add_file_on(db, entry.fid, dst_devid).await.is_ok()
+                    {
                         let _ = std::fs::remove_file(&src_path);
                         let _ = queries::remove_file_on(db, entry.fid, src_devid).await;
+                        let _ = queries::queue_remove(db, entry.fid, "rebalance").await;
+                    } else {
+                        let _ = queries::queue_bump_failure(db, entry.fid, "rebalance", 30).await;
                     }
-                    let _ = queries::queue_remove(db, entry.fid, "rebalance").await;
                 }
                 _ => {
                     let _ = queries::queue_bump_failure(db, entry.fid, "rebalance", 30).await;

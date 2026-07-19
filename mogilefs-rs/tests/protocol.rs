@@ -124,6 +124,22 @@ fn status_code(resp: &[u8]) -> u16 {
     line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Sends a raw HTTP request with an arbitrary method and request-target (so the
+/// target can contain `..` without any client-side normalization) and returns
+/// the status code.
+async fn http_raw(addr: SocketAddr, method: &str, target: &str, body: &[u8]) -> u16 {
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    sock.write_all(body).await.unwrap();
+    let mut resp = Vec::new();
+    sock.read_to_end(&mut resp).await.unwrap();
+    status_code(&resp)
+}
+
 fn url_path(full_url: &str) -> String {
     let after_scheme = full_url.split_once("://").map(|(_, r)| r).unwrap_or(full_url);
     match after_scheme.split_once('/') {
@@ -398,6 +414,47 @@ async fn fsck_finds_missing_blob() {
 async fn rebalance_drains_queue() {
     let tmp = tempfile::tempdir().unwrap();
     run_rebalance_drains_queue(test_config(&tmp, None).await).await;
+}
+
+#[tokio::test]
+async fn storage_rejects_path_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = test_config(&tmp, None).await;
+    let handle = mogilefs_rs::spawn(cfg).await.unwrap();
+    let addr = handle.storage_addr;
+
+    // A PUT that tries to climb out of docroot (tmp/data) into the tempdir root
+    // must be refused with 403 and must NOT create the target file.
+    let escaped = tmp.path().join("pwned");
+    assert_eq!(http_raw(addr, "PUT", "/dev1/../../pwned", b"evil").await, 403);
+    assert!(!escaped.exists(), "traversal PUT must not write outside docroot");
+
+    // GET and DELETE traversal are likewise refused.
+    assert_eq!(http_raw(addr, "GET", "/dev1/../../../etc/passwd", b"").await, 403);
+    assert_eq!(http_raw(addr, "DELETE", "/dev1/../../pwned", b"").await, 403);
+
+    // A single '.' segment and a backslash are also rejected.
+    assert_eq!(http_raw(addr, "GET", "/dev1/./0/000/000/x.fid", b"").await, 403);
+    assert_eq!(http_raw(addr, "PUT", "/dev1/..\\x", b"evil").await, 403);
+}
+
+#[tokio::test]
+async fn storage_rejects_oversize_upload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&tmp, None).await;
+    cfg.max_upload_bytes = 16; // tiny cap for the test
+    let handle = mogilefs_rs::spawn(cfg).await.unwrap();
+    let addr = handle.storage_addr;
+
+    // Under the cap succeeds; over the cap is refused with 413 and leaves no file.
+    assert_eq!(http_raw(addr, "PUT", "/dev1/0/000/000/0000000001.fid", b"small").await, 201);
+    let over = vec![b'x'; 64];
+    assert_eq!(
+        http_raw(addr, "PUT", "/dev1/0/000/000/0000000002.fid", &over).await,
+        413
+    );
+    let leaked = tmp.path().join("data/dev1/0/000/000/0000000002.fid");
+    assert!(!leaked.exists(), "over-cap upload must not leave a partial file");
 }
 
 // ---------------- mysql / postgres (only when a live DSN is provided) ----------------

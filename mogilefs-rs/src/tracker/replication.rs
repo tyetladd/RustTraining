@@ -22,7 +22,8 @@ pub struct Candidate {
 }
 
 fn db_err(e: anyhow::Error) -> MogError {
-    MogError::db_msg(e.to_string())
+    tracing::error!("database error: {e:#}");
+    MogError::db()
 }
 
 async fn all_writable_candidates(db: &Db) -> Result<Vec<Candidate>> {

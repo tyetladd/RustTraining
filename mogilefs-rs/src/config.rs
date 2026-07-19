@@ -36,19 +36,32 @@ pub struct Config {
     /// when the client doesn't request otherwise (mirrors mindevcount).
     #[serde(default = "default_min_devcount")]
     pub default_min_devcount: u32,
+
+    /// Maximum size (bytes) accepted for a single storage-node upload. The
+    /// storage server streams the body to disk and aborts once this is
+    /// exceeded, so an unauthenticated client cannot exhaust memory/disk with
+    /// one giant PUT. Defaults to 8 GiB.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
 }
 
 fn default_db_path() -> String {
     "mogilefs.db".to_string()
 }
 fn default_tracker_ip() -> String {
-    "0.0.0.0".to_string()
+    // Loopback by default: the tracker line protocol has no authentication, so
+    // binding 0.0.0.0 out of the box would expose every admin/destructive
+    // command to the network. Operators who front it with a network ACL can
+    // override this explicitly.
+    "127.0.0.1".to_string()
 }
 fn default_tracker_port() -> u16 {
     7001
 }
 fn default_storage_ip() -> String {
-    "0.0.0.0".to_string()
+    // Loopback by default for the same reason: the storage HTTP server is
+    // unauthenticated. Override explicitly once a network boundary is in place.
+    "127.0.0.1".to_string()
 }
 fn default_storage_port() -> u16 {
     7500
@@ -58,6 +71,9 @@ fn default_docroot() -> String {
 }
 fn default_min_devcount() -> u32 {
     2
+}
+fn default_max_upload_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
 }
 
 impl Config {

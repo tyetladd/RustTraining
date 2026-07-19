@@ -62,7 +62,13 @@ impl Db {
         let store = if let Some(rest) = dsn.strip_prefix("sqlite://") {
             let opts = SqliteConnectOptions::from_str(rest)
                 .with_context(|| format!("parsing sqlite dsn {dsn}"))?
-                .create_if_missing(true);
+                .create_if_missing(true)
+                // sqlx defaults busy_timeout (5s) and foreign_keys (on) but not
+                // journal_mode; WAL lets readers (get_paths/list_keys) run
+                // concurrently with writers instead of serializing and timing
+                // out as "database is locked" under the 16-connection pool.
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5));
             let pool = SqlitePoolOptions::new()
                 .max_connections(16)
                 .connect_with(opts)

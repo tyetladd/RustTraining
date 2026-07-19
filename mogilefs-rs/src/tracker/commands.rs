@@ -8,8 +8,13 @@ use crate::error::MogError;
 use crate::storage::path as storepath;
 use std::sync::Arc;
 
+/// Maps an internal database error to the client-facing `ERR db` line. The
+/// detailed error is logged server-side only — reflecting `e.to_string()` to
+/// an unauthenticated client would leak SQL text, table/column/constraint
+/// names, and (for SQLite) the database file path.
 fn db_err(e: anyhow::Error) -> MogError {
-    MogError::db_msg(e.to_string())
+    tracing::error!("database error: {e:#}");
+    MogError::db()
 }
 
 fn req<'a>(args: &'a Args, name: &str) -> Option<&'a str> {
@@ -154,8 +159,10 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
     let path_arg = req(args, "path").ok_or_else(MogError::no_path)?;
 
     let tf = queries::get_tempfile(db, fid).await.map_err(db_err)?.ok_or_else(MogError::no_temp_file)?;
-    queries::delete_tempfile(db, fid).await.map_err(db_err)?;
 
+    // Validate BEFORE consuming the tempfile, so a validation failure (wrong
+    // devid/path/size/checksum) leaves the reservation intact and the client
+    // can retry create_close — rather than destroying it on the first attempt.
     if !tf.devid_list().contains(&devid) {
         return Err(MogError::invalid_destdev());
     }
@@ -169,7 +176,9 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
     let key_arg = req(args, "key");
 
     let Some(key) = key_arg else {
-        // Client is abandoning this upload: discard the blob it PUT.
+        // Client is abandoning this upload: consume the tempfile and discard
+        // the blob it PUT.
+        queries::delete_tempfile(db, fid).await.map_err(db_err)?;
         let _ = std::fs::remove_file(&fs_path);
         return Ok(Reply::new());
     };
@@ -183,44 +192,48 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
         }
     }
 
-    if let Some(checksum_arg) = req(args, "checksum") {
+    let checksum_to_store: Option<(String, String)> = if let Some(checksum_arg) = req(args, "checksum") {
         let (alg, hexval) = checksum_arg.split_once(':').ok_or_else(MogError::invalid_checksum_format)?;
         let verify = args.get("checksumverify").map(|v| v == "1").unwrap_or(true);
         if verify {
             let data = std::fs::read(&fs_path).map_err(|_| MogError::size_verify_error())?;
-            let computed = match alg.to_ascii_uppercase().as_str() {
-                "MD5" => {
-                    use md5::{Digest, Md5};
-                    let mut h = Md5::new();
-                    h.update(&data);
-                    hex::encode(h.finalize())
-                }
-                "SHA1" => {
-                    use sha1::{Digest, Sha1};
-                    let mut h = Sha1::new();
-                    h.update(&data);
-                    hex::encode(h.finalize())
-                }
-                _ => return Err(MogError::invalid_checksum_format()),
-            };
+            let computed =
+                crate::util::compute_checksum_hex(alg, &data).ok_or_else(MogError::invalid_checksum_format)?;
             if !computed.eq_ignore_ascii_case(hexval) {
                 return Err(MogError::checksum_mismatch());
             }
         }
-        queries::set_checksum(db, fid, alg, hexval).await.map_err(db_err)?;
+        Some((alg.to_string(), hexval.to_string()))
+    } else {
+        None
+    };
+
+    // Consume the tempfile now (all validation has passed). This is also the
+    // race guard: if a concurrent create_close already consumed it, we deleted
+    // nothing and must not double-finalize.
+    if !queries::delete_tempfile(db, fid).await.map_err(db_err)? {
+        return Err(MogError::no_temp_file());
     }
 
     // Overwrite semantics: replacing an existing key retires the old fid.
-    if let Some(old) = queries::get_file_by_key(db, tf.dmid, key).await.map_err(db_err)? {
-        if old.fid != fid {
-            queries::delete_file_row(db, old.fid).await.map_err(db_err)?;
-            queries::dequeue_replicate(db, old.fid).await.map_err(db_err)?;
-            queries::queue_delete(db, old.fid).await.map_err(db_err)?;
-        }
+    let retire_old = queries::get_file_by_key(db, tf.dmid, key)
+        .await
+        .map_err(db_err)?
+        .map(|old| old.fid)
+        .filter(|&old_fid| old_fid != fid);
+
+    queries::finalize_file(db, fid, tf.dmid, key, actual_size, tf.classid, devid, retire_old)
+        .await
+        .map_err(db_err)?;
+
+    if let Some(old_fid) = retire_old {
+        queries::dequeue_replicate(db, old_fid).await.map_err(db_err)?;
+        queries::queue_delete(db, old_fid).await.map_err(db_err)?;
     }
 
-    queries::insert_file(db, fid, tf.dmid, key, actual_size, tf.classid).await.map_err(db_err)?;
-    queries::add_file_on(db, fid, devid).await.map_err(db_err)?;
+    if let Some((alg, hexval)) = checksum_to_store {
+        queries::set_checksum(db, fid, &alg, &hexval).await.map_err(db_err)?;
+    }
 
     let mindevcount = replication::resolve_class_mindevcount(db, tf.dmid, tf.classid, state.cfg.default_min_devcount as i64).await?;
     if mindevcount > 1 {
@@ -662,7 +675,10 @@ async fn cmd_httpcopy(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogEr
     if let Some(parent) = dst.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::copy(&src, &dst).map_err(|e| MogError::new("copy_err", e.to_string()))?;
+    std::fs::copy(&src, &dst).map_err(|e| {
+        tracing::error!("httpcopy fid {fid} dev {sdevid}->{ddevid}: {e}");
+        MogError::new("copy_err", "failed to copy file between devices")
+    })?;
     queries::add_file_on(db, fid, ddevid).await.map_err(db_err)?;
     Ok(Reply::new())
 }

@@ -25,17 +25,44 @@ pub fn eurl_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
+        if bytes[i] == b'%' {
+            // Use get() rather than slicing: a literal '%' followed by bytes
+            // that fall inside a multi-byte UTF-8 char is not a char boundary,
+            // and `&s[i+1..i+3]` would panic. get() returns None instead.
+            if let Some(hex) = s.get(i + 1..i + 3) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
             }
         }
         out.push(bytes[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Computes the lowercase hex digest of `data` for a MogileFS checksum
+/// algorithm name (`MD5` or `SHA1`, case-insensitive). Returns `None` for an
+/// unrecognized algorithm. Shared by `create_close` verification and the fsck
+/// worker so the two cannot drift on which algorithms they support.
+pub fn compute_checksum_hex(alg: &str, data: &[u8]) -> Option<String> {
+    match alg.to_ascii_uppercase().as_str() {
+        "MD5" => {
+            use md5::{Digest, Md5};
+            let mut h = Md5::new();
+            h.update(data);
+            Some(hex::encode(h.finalize()))
+        }
+        "SHA1" => {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(data);
+            Some(hex::encode(h.finalize()))
+        }
+        _ => None,
+    }
 }
 
 /// Encode a set of key/value pairs as `k1=v1&k2=v2...` using `eurl_encode`.
@@ -81,6 +108,17 @@ mod tests {
     fn space_becomes_plus() {
         assert_eq!(eurl_encode("a b"), "a+b");
         assert_eq!(eurl_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn decode_percent_before_multibyte_does_not_panic() {
+        // A literal '%' followed by a multi-byte UTF-8 char must not panic on
+        // a non-char-boundary slice; the '%' is passed through unchanged.
+        assert_eq!(eurl_decode("%\u{20ac}x"), "%\u{20ac}x");
+        assert_eq!(eurl_decode("%"), "%");
+        assert_eq!(eurl_decode("%4"), "%4");
+        // A well-formed escape still decodes.
+        assert_eq!(eurl_decode("%41"), "A");
     }
 
     #[test]
