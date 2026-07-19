@@ -1,13 +1,14 @@
 use super::replication;
 use super::AppState;
 use crate::db::queries;
-use crate::storage::path as storepath;
+use crate::storage::client;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Periodically stats each device's backing directory (equivalent to the
-/// real tracker polling `GET /devN/usage` on the storage node) and records
-/// `mb_total`/`mb_used`, used by device-selection freespace weighting.
+/// Periodically polls `GET /dev<N>/usage` on each device's **owning host** (over
+/// HTTP, exactly as the reference tracker polls `mogstored`) and records
+/// `mb_total`/`mb_used`, used by device-selection freespace weighting. This
+/// works whether the device is on this node or a remote storage node.
 pub async fn run_monitor(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     loop {
@@ -15,17 +16,9 @@ pub async fn run_monitor(state: Arc<AppState>) {
         let db = &state.db;
         let Ok(devices) = queries::list_devices(db).await else { continue };
         for d in devices {
-            let dir = storepath::device_root(&state.cfg.docroot, d.devid);
-            if std::fs::create_dir_all(&dir).is_err() {
-                continue;
+            if let Ok((total_mb, used_mb)) = client::usage(db, d.devid).await {
+                let _ = queries::update_device_usage(db, d.devid, total_mb, used_mb).await;
             }
-            // Store megabytes: the columns are named mb_total/mb_used and the
-            // reference tracker records MB (it divides the storage node's
-            // KB-reported usage by 1024). Dividing bytes by 1024*1024 gives MB.
-            let total_mb = (fs4::total_space(&dir).unwrap_or(0) / (1024 * 1024)) as i64;
-            let avail_mb = (fs4::available_space(&dir).unwrap_or(0) / (1024 * 1024)) as i64;
-            let used_mb = total_mb.saturating_sub(avail_mb);
-            let _ = queries::update_device_usage(db, d.devid, total_mb, used_mb).await;
         }
     }
 }
@@ -63,16 +56,12 @@ pub async fn run_replicate(state: Arc<AppState>) {
                 let _ = queries::bump_replicate_failure(db, fid, 30).await;
                 continue;
             };
-            let src_path = storepath::fs_path(&state.cfg.docroot, src_devid, fid);
             match replication::select_devices(db, need, &have).await {
                 Ok(targets) => {
                     let mut all_ok = true;
                     for t in targets {
-                        let dst_path = storepath::fs_path(&state.cfg.docroot, t.devid, fid);
-                        if let Some(parent) = dst_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if std::fs::copy(&src_path, &dst_path).is_ok() {
+                        // Copy from the source host to the target host over HTTP.
+                        if client::copy(db, src_devid, t.devid, fid).await.is_ok() {
                             let _ = queries::add_file_on(db, fid, t.devid).await;
                         } else {
                             all_ok = false;
@@ -104,8 +93,8 @@ pub async fn run_delete(state: Arc<AppState>) {
         for fid in pending {
             let devids = queries::get_devids_for_fid(db, fid).await.unwrap_or_default();
             for devid in &devids {
-                let path = storepath::fs_path(&state.cfg.docroot, *devid, fid);
-                let _ = std::fs::remove_file(&path);
+                // Delete the blob on its owning host over HTTP.
+                let _ = client::delete(db, *devid, fid).await;
                 let _ = queries::remove_file_on(db, fid, *devid).await;
             }
             let _ = queries::dequeue_delete(db, fid).await;
@@ -146,19 +135,21 @@ pub async fn run_fsck(state: Arc<AppState>) {
 
             let mut live = Vec::new();
             for devid in &devids {
-                let path = storepath::fs_path(&state.cfg.docroot, *devid, f.fid);
-                if path.exists() {
-                    live.push(*devid);
-                } else {
-                    let _ = queries::fsck_log(db, f.fid, "missing", Some(*devid)).await;
-                    let _ = queries::remove_file_on(db, f.fid, *devid).await;
+                // Check existence on the device's owning host over HTTP.
+                match client::exists(db, *devid, f.fid).await {
+                    Ok(true) => live.push(*devid),
+                    Ok(false) => {
+                        let _ = queries::fsck_log(db, f.fid, "missing", Some(*devid)).await;
+                        let _ = queries::remove_file_on(db, f.fid, *devid).await;
+                    }
+                    // On a transient host error, don't treat the replica as lost.
+                    Err(_) => live.push(*devid),
                 }
             }
 
             if let Ok(Some((alg, hexval))) = queries::get_checksum(db, f.fid).await {
                 if let Some(&devid) = live.first() {
-                    let path = storepath::fs_path(&state.cfg.docroot, devid, f.fid);
-                    if let Ok(data) = std::fs::read(&path) {
+                    if let Ok(Some(data)) = client::get_bytes(db, devid, f.fid).await {
                         if let Some(computed) = crate::util::compute_checksum_hex(&alg, &data) {
                             if !computed.eq_ignore_ascii_case(&hexval) {
                                 let _ = queries::fsck_log(db, f.fid, "checksum_mismatch", Some(devid)).await;
@@ -211,20 +202,15 @@ pub async fn run_rebalance(state: Arc<AppState>) {
             match replication::select_devices(db, 1, &existing).await {
                 Ok(targets) if !targets.is_empty() => {
                     let dst_devid = targets[0].devid;
-                    let src_path = storepath::fs_path(&state.cfg.docroot, src_devid, entry.fid);
-                    let dst_path = storepath::fs_path(&state.cfg.docroot, dst_devid, entry.fid);
-                    if let Some(parent) = dst_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
                     // Only drop the source copy once the destination copy is
-                    // both on disk AND recorded. If add_file_on fails, leave the
+                    // both on its host AND recorded. If either fails, leave the
                     // source intact — otherwise a fid whose only replica was on
                     // src would end up tracked on neither device (lost file)
                     // even though the bytes exist on dst.
-                    if std::fs::copy(&src_path, &dst_path).is_ok()
+                    if client::copy(db, src_devid, dst_devid, entry.fid).await.is_ok()
                         && queries::add_file_on(db, entry.fid, dst_devid).await.is_ok()
                     {
-                        let _ = std::fs::remove_file(&src_path);
+                        let _ = client::delete(db, src_devid, entry.fid).await;
                         let _ = queries::remove_file_on(db, entry.fid, src_devid).await;
                         let _ = queries::queue_remove(db, entry.fid, "rebalance").await;
                     } else {

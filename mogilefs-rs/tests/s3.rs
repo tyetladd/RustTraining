@@ -77,8 +77,10 @@ async fn s3_bucket_and_object_lifecycle() {
     let handle = mogilefs_rs::spawn(test_config(&tmp).await).await.unwrap();
     let s3 = handle.s3_addr;
 
-    // A device is required for object storage; register one via the tracker.
-    setup_device(handle.tracker_addr).await;
+    // A device is required for object storage; register one via the tracker,
+    // pointing at this node's real (ephemeral) storage port so the gateway can
+    // route blob I/O to it over HTTP.
+    setup_device(handle.tracker_addr, handle.storage_addr.port()).await;
 
     // Bucket does not exist yet.
     assert_eq!(request(s3, "HEAD", "/mybucket", &[], b"").await.status, 404);
@@ -173,7 +175,7 @@ async fn s3_bucket_and_object_lifecycle() {
 
 /// Registers one alive host+device via the tracker line protocol so the S3
 /// gateway has somewhere to place object bytes.
-async fn setup_device(tracker: SocketAddr) {
+async fn setup_device(tracker: SocketAddr, storage_port: u16) {
     use mogilefs_rs::util::encode_args;
     let mut sock = TcpStream::connect(tracker).await.unwrap();
     async fn cmd(sock: &mut TcpStream, name: &str, pairs: &[(&str, &str)]) {
@@ -184,7 +186,8 @@ async fn setup_device(tracker: SocketAddr) {
         let resp = String::from_utf8_lossy(&buf[..n]);
         assert!(resp.starts_with("OK"), "tracker {name} failed: {resp}");
     }
-    cmd(&mut sock, "create_host", &[("host", "h1"), ("ip", "127.0.0.1"), ("port", "7500")]).await;
+    let port = storage_port.to_string();
+    cmd(&mut sock, "create_host", &[("host", "h1"), ("ip", "127.0.0.1"), ("port", &port)]).await;
     cmd(&mut sock, "update_host", &[("host", "h1"), ("status", "alive")]).await;
     cmd(&mut sock, "create_device", &[("host", "h1"), ("devid", "1")]).await;
     cmd(&mut sock, "set_state", &[("host", "h1"), ("device", "1"), ("state", "alive")]).await;

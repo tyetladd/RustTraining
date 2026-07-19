@@ -1,9 +1,12 @@
 # mdbook build output
 **/book/
 
-# xtask output
+# xtask output (GitHub Pages build of the training books)
 site/
 docs/
+# ...but the mogilefs-rs crate keeps hand-written docs under its own docs/
+!mogilefs-rs/docs/
+!mogilefs-rs/docs/**
 target/
 
 # Zone.Identifier files (Windows/WSL artifact)

@@ -52,52 +52,51 @@ pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
 
     let mut tasks = Vec::new();
 
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::serve(tracker_listener, s).await;
-    }));
+    // Each role is independently enabled so one process can be a storage node in
+    // a location, a metadata tracker, an S3 gateway, or (default) all at once.
+    // The listeners are always bound so the handle reports stable addresses; a
+    // disabled role simply doesn't serve.
+    if cfg.enable_tracker {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            tracker::serve(tracker_listener, s).await;
+        }));
+    }
 
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        if let Err(e) = storage::serve(storage_listener, s).await {
-            tracing::error!("storage server error: {e:#}");
-        }
-    }));
+    if cfg.enable_storage {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = storage::serve(storage_listener, s).await {
+                tracing::error!("storage server error: {e:#}");
+            }
+        }));
+    }
 
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        if let Err(e) = s3::serve(s3_listener, s).await {
-            tracing::error!("s3 gateway error: {e:#}");
-        }
-    }));
+    if cfg.enable_s3 {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = s3::serve(s3_listener, s).await {
+                tracing::error!("s3 gateway error: {e:#}");
+            }
+        }));
+    }
 
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::workers::run_monitor(s).await;
-    }));
-
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::workers::run_replicate(s).await;
-    }));
-
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::workers::run_delete(s).await;
-    }));
-
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::workers::run_fsck(s).await;
-    }));
-
-    let s = state.clone();
-    tasks.push(tokio::spawn(async move {
-        tracker::workers::run_rebalance(s).await;
-    }));
+    if cfg.enable_workers {
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move { tracker::workers::run_monitor(s).await }));
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move { tracker::workers::run_replicate(s).await }));
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move { tracker::workers::run_delete(s).await }));
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move { tracker::workers::run_fsck(s).await }));
+        let s = state.clone();
+        tasks.push(tokio::spawn(async move { tracker::workers::run_rebalance(s).await }));
+    }
 
     tracing::info!(
-        "tracker on {tracker_addr}, storage on {storage_addr}, s3 gateway on {s3_addr}"
+        "roles[tracker={} storage={} s3={} workers={}] tracker={tracker_addr} storage={storage_addr} s3={s3_addr}",
+        cfg.enable_tracker, cfg.enable_storage, cfg.enable_s3, cfg.enable_workers
     );
 
     Ok(ServerHandle {

@@ -4,18 +4,14 @@
 use super::xml;
 use super::{empty_body, full_body, response, SBody};
 use crate::db::queries;
-use crate::storage::path as storepath;
 use crate::tracker::{replication, store_ops, AppState};
-use http_body_util::{BodyExt, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use hyper::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION, RANGE,
 };
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use std::collections::BTreeMap;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio_stream::StreamExt;
-use tokio_util::io::ReaderStream;
 
 /// An S3 error mapped to an HTTP status + error code, rendered as the standard
 /// S3 XML error document.
@@ -241,6 +237,14 @@ pub async fn put_object(state: &AppState, bucket: &str, key: &str, req: Request<
         .map(|s| s.to_string());
     let user_meta = collect_user_meta(req.headers());
 
+    // Buffer + hash the body (bounded by the single-PUT cap; larger objects are
+    // a job for multipart upload, a later phase), then route it to the chosen
+    // device's owning storage host over HTTP.
+    let (body_bytes, size, etag) = match buffer_and_hash(req, state.cfg.s3_max_single_put).await {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+
     // Pick a destination device and reserve a fid (mirrors create_open).
     let candidates = replication::select_devices(&state.db, 1, &[])
         .await
@@ -251,24 +255,10 @@ pub async fn put_object(state: &AppState, bucket: &str, key: &str, req: Request<
         .await
         .map_err(db_err)?;
 
-    let fs_path = storepath::fs_path(&state.cfg.docroot, devid, fid);
-    if let Some(parent) = fs_path.parent() {
-        if tokio::fs::create_dir_all(parent).await.is_err() {
-            let _ = queries::delete_tempfile(&state.db, fid).await;
-            return Err(S3Error::internal("failed to create storage directory"));
-        }
+    if crate::storage::client::put_bytes(&state.db, devid, fid, body_bytes).await.is_err() {
+        let _ = queries::delete_tempfile(&state.db, fid).await;
+        return Err(S3Error::internal("failed to store object on device"));
     }
-
-    // Stream the body to disk, hashing (for the ETag) and size-capping as we go.
-    let write_result = stream_to_disk(req, &fs_path, state.cfg.max_upload_bytes).await;
-    let (size, etag) = match write_result {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&fs_path).await;
-            let _ = queries::delete_tempfile(&state.db, fid).await;
-            return Err(e);
-        }
-    };
 
     queries::delete_tempfile(&state.db, fid).await.map_err(db_err)?;
     store_ops::finalize_blob(state, fid, dmid, key, 0, devid, size as i64, Some(("MD5".to_string(), etag.clone())))
@@ -296,33 +286,27 @@ pub async fn put_object(state: &AppState, bucket: &str, key: &str, req: Request<
         .unwrap())
 }
 
-/// Streams a request body to `fs_path`, returning (bytes_written, md5_hex).
-async fn stream_to_disk(
-    req: Request<Incoming>,
-    fs_path: &std::path::Path,
-    max_bytes: u64,
-) -> Result<(u64, String), S3Error> {
+/// Reads a request body into memory (bounded by `max_bytes`) while computing its
+/// MD5, returning (bytes, size, md5_hex). Buffering keeps the routed PUT simple;
+/// objects larger than the single-PUT cap are meant for multipart upload.
+async fn buffer_and_hash(req: Request<Incoming>, max_bytes: u64) -> Result<(Vec<u8>, u64, String), S3Error> {
     use md5::{Digest, Md5};
-    let mut file = tokio::fs::File::create(fs_path)
-        .await
-        .map_err(|_| S3Error::internal("failed to create object file"))?;
     let mut body = req.into_body();
     let mut hasher = Md5::new();
-    let mut size: u64 = 0;
+    let mut buf: Vec<u8> = Vec::new();
 
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| S3Error::internal("error reading request body"))?;
         if let Ok(chunk) = frame.into_data() {
-            size += chunk.len() as u64;
-            if size > max_bytes {
+            if buf.len() as u64 + chunk.len() as u64 > max_bytes {
                 return Err(S3Error::too_large());
             }
             hasher.update(&chunk);
-            file.write_all(&chunk).await.map_err(|_| S3Error::internal("write error"))?;
+            buf.extend_from_slice(&chunk);
         }
     }
-    file.flush().await.map_err(|_| S3Error::internal("flush error"))?;
-    Ok((size, hex::encode(hasher.finalize())))
+    let size = buf.len() as u64;
+    Ok((buf, size, hex::encode(hasher.finalize())))
 }
 
 pub async fn delete_object(state: &AppState, bucket: &str, key: &str) -> OpResult {
@@ -369,29 +353,35 @@ pub async fn get_object(
     };
     let mtime = meta.as_ref().map(|m| m.mtime).unwrap_or(0);
 
-    // Locate a device that actually has the blob on local disk.
+    // Pick a device holding the blob (prefer one that HEADs OK on its host).
     let devids = queries::get_devids_for_fid(&state.db, file.fid).await.map_err(db_err)?;
-    let mut fs_path = None;
-    for devid in devids {
-        let p = storepath::fs_path(&state.cfg.docroot, devid, file.fid);
-        if p.exists() {
-            fs_path = Some(p);
+    let mut chosen_dev = None;
+    for devid in &devids {
+        if crate::storage::client::exists(&state.db, *devid, file.fid).await.unwrap_or(false) {
+            chosen_dev = Some(*devid);
             break;
         }
     }
-    let fs_path = fs_path.ok_or_else(|| S3Error::internal("object data not found on any device"))?;
+    let devid = chosen_dev
+        .or_else(|| devids.first().copied())
+        .ok_or_else(|| S3Error::internal("object data not found on any device"))?;
 
-    // Optional Range request.
-    let range = req.headers().get(RANGE).and_then(|v| v.to_str().ok()).and_then(|r| parse_range(r, total));
-    let (status, offset, length, content_range) = match range {
+    // Range: validate locally for the response line, and forward to the storage
+    // node so it only ships the requested bytes.
+    let range_header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
+    let range = range_header.and_then(|r| parse_range(r, total));
+    let (status, content_range) = match range {
         Some((start, end)) => {
             if start > end || start >= total {
                 return Err(S3Error::invalid_range());
             }
-            let len = end - start + 1;
-            (StatusCode::PARTIAL_CONTENT, start, len, Some(format!("bytes {start}-{end}/{total}")))
+            (StatusCode::PARTIAL_CONTENT, Some(format!("bytes {start}-{end}/{total}")))
         }
-        None => (StatusCode::OK, 0u64, total, None),
+        None => (StatusCode::OK, None),
+    };
+    let length = match range {
+        Some((start, end)) => end - start + 1,
+        None => total,
     };
 
     let last_modified = httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64));
@@ -411,17 +401,17 @@ pub async fn get_object(
         return Ok(builder.body(empty_body()).unwrap());
     }
 
-    let mut file = tokio::fs::File::open(&fs_path)
+    // Proxy-stream the bytes from the owning storage host (possibly remote).
+    let upstream = crate::storage::client::get_response(&state.db, devid, file.fid, range_header)
         .await
-        .map_err(|_| S3Error::internal("failed to open object data"))?;
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|_| S3Error::internal("seek error"))?;
+        .map_err(|_| S3Error::internal("failed to read object from storage host"))?;
+    if !upstream.status().is_success() {
+        return Err(S3Error::internal("storage host returned an error"));
     }
-    let limited = file.take(length);
-    let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
-    let body = StreamBody::new(stream).boxed();
+    let body = upstream
+        .into_body()
+        .map_err(std::io::Error::other)
+        .boxed();
     Ok(builder.body(body).unwrap())
 }
 

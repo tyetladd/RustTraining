@@ -1,3 +1,4 @@
+pub mod client;
 pub mod path;
 
 use crate::tracker::AppState;
@@ -81,14 +82,10 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response
 
     match method {
         Method::PUT => put_blob(req, &fs_path, state.cfg.max_upload_bytes).await,
-        Method::GET => match tokio::fs::read(&fs_path).await {
-            Ok(data) => Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_LENGTH, data.len())
-                .body(Full::new(Bytes::from(data)))
-                .unwrap()),
-            Err(_) => Ok(empty(StatusCode::NOT_FOUND)),
-        },
+        Method::GET => {
+            let range = req.headers().get(hyper::header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            get_blob(&fs_path, range.as_deref()).await
+        }
         Method::HEAD => match tokio::fs::metadata(&fs_path).await {
             Ok(meta) => Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -105,6 +102,76 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Result<Response
             }
         }
         _ => Ok(empty(StatusCode::METHOD_NOT_ALLOWED)),
+    }
+}
+
+/// Serves a blob, honoring a single `Range: bytes=...` spec (206 + Content-Range)
+/// when present. Reads only the requested bytes off disk.
+async fn get_blob(fs_path: &std::path::Path, range: Option<&str>) -> Result<Response<BoxBody>, Infallible> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let meta = match tokio::fs::metadata(fs_path).await {
+        Ok(m) => m,
+        Err(_) => return Ok(empty(StatusCode::NOT_FOUND)),
+    };
+    let total = meta.len();
+
+    let (status, offset, length, content_range) = match range.and_then(|r| parse_range(r, total)) {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{total}")),
+        ),
+        None => (StatusCode::OK, 0, total, None),
+    };
+
+    let mut file = match tokio::fs::File::open(fs_path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(empty(StatusCode::NOT_FOUND)),
+    };
+    if offset > 0 && file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+        return Ok(empty(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+    let mut buf = vec![0u8; length as usize];
+    if file.read_exact(&mut buf).await.is_err() {
+        return Ok(empty(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, length)
+        .header(hyper::header::ACCEPT_RANGES, "bytes");
+    if let Some(cr) = content_range {
+        builder = builder.header(hyper::header::CONTENT_RANGE, cr);
+    }
+    Ok(builder.body(Full::new(Bytes::from(buf))).unwrap())
+}
+
+/// Parses `bytes=start-end` / `bytes=start-` / `bytes=-suffix` into an inclusive
+/// (start, end) byte range within `total`.
+fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    if a.is_empty() {
+        let n: u64 = b.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        Some((total - n, total - 1))
+    } else {
+        let start: u64 = a.parse().ok()?;
+        if start >= total {
+            return None;
+        }
+        let end = if b.is_empty() { total - 1 } else { b.parse::<u64>().ok()?.min(total - 1) };
+        if start > end {
+            return None;
+        }
+        Some((start, end))
     }
 }
 

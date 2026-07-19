@@ -172,19 +172,23 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
         return Err(MogError::bogus_args());
     }
 
-    let fs_path = storepath::fs_path(&state.cfg.docroot, devid, fid);
     let key_arg = req(args, "key");
 
     let Some(key) = key_arg else {
         // Client is abandoning this upload: consume the tempfile and discard
-        // the blob it PUT.
+        // the blob it PUT to its owning storage host.
         queries::delete_tempfile(db, fid).await.map_err(db_err)?;
-        let _ = std::fs::remove_file(&fs_path);
+        let _ = crate::storage::client::delete(db, devid, fid).await;
         return Ok(Reply::new());
     };
 
-    let meta = std::fs::metadata(&fs_path).map_err(|_| MogError::size_verify_error())?;
-    let actual_size = meta.len() as i64;
+    // The blob was PUT by the client directly to the device's owning storage
+    // host; verify size/checksum there over HTTP (works whether that host is
+    // this process or a remote node).
+    let actual_size = crate::storage::client::head(db, devid, fid)
+        .await
+        .map_err(|_| MogError::size_verify_error())?
+        .ok_or_else(MogError::size_verify_error)? as i64;
     if let Some(size_str) = req(args, "size") {
         let expected: i64 = size_str.parse().map_err(|_| MogError::bad_params_msg("invalid size"))?;
         if expected != actual_size {
@@ -196,7 +200,10 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
         let (alg, hexval) = checksum_arg.split_once(':').ok_or_else(MogError::invalid_checksum_format)?;
         let verify = args.get("checksumverify").map(|v| v == "1").unwrap_or(true);
         if verify {
-            let data = std::fs::read(&fs_path).map_err(|_| MogError::size_verify_error())?;
+            let data = crate::storage::client::get_bytes(db, devid, fid)
+                .await
+                .map_err(|_| MogError::size_verify_error())?
+                .ok_or_else(MogError::size_verify_error)?;
             let computed =
                 crate::util::compute_checksum_hex(alg, &data).ok_or_else(MogError::invalid_checksum_format)?;
             if !computed.eq_ignore_ascii_case(hexval) {
@@ -264,8 +271,10 @@ async fn cmd_get_paths(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogE
 
     if !noverify {
         if let Some((d, _h)) = chosen.first() {
-            let fs_path = storepath::fs_path(&state.cfg.docroot, d.devid, file.fid);
-            if !fs_path.exists() && chosen.len() > 1 {
+            // Verify the first path really has the blob, over HTTP to its owning
+            // host (which may be a remote storage node).
+            let present = crate::storage::client::exists(db, d.devid, file.fid).await.unwrap_or(true);
+            if !present && chosen.len() > 1 {
                 chosen.remove(0);
             }
         }
@@ -647,12 +656,8 @@ async fn cmd_httpcopy(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogEr
     queries::get_device(db, sdevid).await.map_err(db_err)?.ok_or_else(MogError::unknown_device)?;
     queries::get_device(db, ddevid).await.map_err(db_err)?.ok_or_else(MogError::unknown_device)?;
 
-    let src = storepath::fs_path(&state.cfg.docroot, sdevid, fid);
-    let dst = storepath::fs_path(&state.cfg.docroot, ddevid, fid);
-    if let Some(parent) = dst.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::copy(&src, &dst).map_err(|e| {
+    // Copy across the (possibly different) owning hosts over HTTP.
+    crate::storage::client::copy(db, sdevid, ddevid, fid).await.map_err(|e| {
         tracing::error!("httpcopy fid {fid} dev {sdevid}->{ddevid}: {e}");
         MogError::new("copy_err", "failed to copy file between devices")
     })?;

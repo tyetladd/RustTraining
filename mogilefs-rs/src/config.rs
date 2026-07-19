@@ -48,6 +48,27 @@ pub struct Config {
     /// one giant PUT. Defaults to 8 GiB.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
+
+    /// Maximum size (bytes) for a single S3 `PutObject`. The gateway buffers the
+    /// object in memory before routing it to the owning storage host, so this is
+    /// deliberately modest; larger objects are the job of multipart upload (a
+    /// later phase). Defaults to 256 MiB.
+    #[serde(default = "default_s3_max_single_put")]
+    pub s3_max_single_put: u64,
+
+    /// Which roles this process runs. A node can be a storage node in one
+    /// location (`storage` only), a metadata tracker (`tracker` + `workers`), an
+    /// S3 gateway, or — the default — all of them at once (single-host mode).
+    /// Multiple nodes sharing one `db_dsn` form a cluster; blob I/O routes to
+    /// each device's owning host over HTTP.
+    #[serde(default = "default_true")]
+    pub enable_tracker: bool,
+    #[serde(default = "default_true")]
+    pub enable_storage: bool,
+    #[serde(default = "default_true")]
+    pub enable_s3: bool,
+    #[serde(default = "default_true")]
+    pub enable_workers: bool,
 }
 
 fn default_db_path() -> String {
@@ -87,6 +108,12 @@ fn default_min_devcount() -> u32 {
 }
 fn default_max_upload_bytes() -> u64 {
     8 * 1024 * 1024 * 1024
+}
+fn default_s3_max_single_put() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_true() -> bool {
+    true
 }
 
 impl Config {

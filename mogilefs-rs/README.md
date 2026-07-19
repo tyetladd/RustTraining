@@ -9,6 +9,10 @@ Implemented by reviewing the reference Perl tracker (`mogilefs/MogileFS-Server`)
 (`mogilefs/perl-MogileFS-Client`) source directly — see "Wire compatibility" below for the exact contracts
 this reimplementation matches byte-for-byte.
 
+> **Migrating from an existing MogileFS deployment?** The on-disk blob layout is byte-identical, so the
+> data never moves — migration is metadata-only. See **[docs/MIGRATION.md](docs/MIGRATION.md)** for a
+> phased, reversible plan (including the multi-host prerequisite for large multi-node fleets).
+
 ## Running
 
 ```
@@ -46,6 +50,38 @@ update_host host=h1 status=alive
 create_device host=h1 devid=1
 set_state host=h1 device=1 state=alive
 ```
+
+### Running in multiple locations (a real cluster)
+
+The roles are independently switchable, so `mogilefsd` runs distributed just like real MogileFS: **storage
+nodes** in each location plus **tracker/gateway nodes**, all sharing one `db_dsn`. All server-side blob I/O
+(create_close verification, `get_paths` verification, replicate/rebalance/delete/fsck, and the S3 gateway)
+routes to each device's **owning host** over HTTP — a device lives on exactly one host
+(`device.hostid` → `host.hostip`/`host.http_port`), and the tracker reaches it there whether it is local or
+across the network.
+
+```toml
+# storage node in location A (serves its local docroot only)
+enable_storage = true
+enable_tracker = false
+enable_s3 = false
+enable_workers = false
+storage_port = 7500
+docroot = "/srv/mogdata"
+db_dsn = "mysql://mogile:...@db-host/mogilefs"   # shared with every node
+```
+
+```toml
+# tracker + S3 gateway node (holds no data; coordinates the cluster)
+enable_storage = false
+db_dsn = "mysql://mogile:...@db-host/mogilefs"   # same DB
+```
+
+Then register each storage node as a host with its real ip/port and add its devices
+(`create_host host=locA ip=10.0.0.5 port=7500`, `create_device host=locA devid=…`). Clients talk to any
+tracker; reads/writes flow directly between the client and the owning storage node via the URLs
+`get_paths`/`create_open` return. See **[docs/MIGRATION.md](docs/MIGRATION.md)** for the full cluster
+topology and a 100 TB migration plan.
 
 ## Wire compatibility
 
@@ -143,12 +179,11 @@ Background workers mirror the reference tracker's Monitor/Replicate/Delete/Fsck/
 - **Rebalance** (opt-in via `rebalance_start`): seeds a queue from the currently most-utilized device's
   files and moves each one's copy onto a less-utilized device without changing its replica count.
 
-### Simplifications versus a real multi-host deployment
+### Simplifications
 
-Checksum verification and fsck both read files directly off local disk rather than through the mgmt-port
-side-channel protocol real `mogstored` exposes — correct here since tracker and storage share one process,
-but not something a genuinely distributed deployment could rely on. `edit_file` is deliberately minimal
-(the real tracker's implementation is itself labeled experimental).
+`edit_file` is deliberately minimal (the real tracker's implementation is itself labeled experimental), and
+the S3 gateway buffers a single `PutObject` in memory (bounded by `s3_max_single_put`) since multipart
+upload is a later phase. Everything else in the client-facing and administrative surface is implemented.
 
 ## Tests
 
