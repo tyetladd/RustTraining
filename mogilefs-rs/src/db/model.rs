@@ -1,0 +1,124 @@
+#[derive(Debug, Clone)]
+pub struct Domain {
+    pub dmid: i64,
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Class {
+    pub dmid: i64,
+    pub classid: i64,
+    pub classname: String,
+    pub mindevcount: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostStatus {
+    Alive,
+    Dead,
+    Down,
+}
+
+impl HostStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HostStatus::Alive => "alive",
+            HostStatus::Dead => "dead",
+            HostStatus::Down => "down",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "alive" => Some(HostStatus::Alive),
+            "dead" => Some(HostStatus::Dead),
+            "down" => Some(HostStatus::Down),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Host {
+    pub hostid: i64,
+    pub hostname: String,
+    pub hostip: Option<String>,
+    pub status: String,
+    pub http_port: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceStatus {
+    Alive,
+    Dead,
+    Down,
+    Drain,
+    ReadOnly,
+}
+
+impl DeviceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceStatus::Alive => "alive",
+            DeviceStatus::Dead => "dead",
+            DeviceStatus::Down => "down",
+            DeviceStatus::Drain => "drain",
+            DeviceStatus::ReadOnly => "readonly",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "alive" => Some(DeviceStatus::Alive),
+            "dead" => Some(DeviceStatus::Dead),
+            "down" => Some(DeviceStatus::Down),
+            "drain" => Some(DeviceStatus::Drain),
+            "readonly" => Some(DeviceStatus::ReadOnly),
+            _ => None,
+        }
+    }
+    /// Devices we may write new file copies to.
+    pub fn writeable(&self) -> bool {
+        matches!(self, DeviceStatus::Alive)
+    }
+    /// Devices we may still read existing copies from.
+    pub fn readable(&self) -> bool {
+        matches!(self, DeviceStatus::Alive | DeviceStatus::Drain | DeviceStatus::ReadOnly)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub devid: i64,
+    pub hostid: i64,
+    pub status: String,
+    pub weight: i64,
+    pub mb_total: Option<i64>,
+    pub mb_used: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileRow {
+    pub fid: i64,
+    pub dmid: i64,
+    pub dkey: String,
+    pub length: Option<i64>,
+    pub classid: i64,
+    pub devcount: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TempfileRow {
+    pub fid: i64,
+    pub dmid: i64,
+    pub dkey: Option<String>,
+    pub classid: i64,
+    pub devids: String,
+}
+
+impl TempfileRow {
+    pub fn devid_list(&self) -> Vec<i64> {
+        self.devids
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "mogilefs-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Single-binary MogileFS tracker + storage server, wire-compatible with the reference Perl implementation"
+
+[[bin]]
+name = "mogilefsd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = { version = "0.24", features = ["bundled"] }
+percent-encoding = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+fs4 = "0.8"
+sha1 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
