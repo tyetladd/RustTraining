@@ -46,6 +46,8 @@ tracker_listen_ip = "127.0.0.1"
 tracker_port = 0
 storage_listen_ip = "127.0.0.1"
 storage_port = 0
+s3_listen_ip = "127.0.0.1"
+s3_port = 0
 docroot = "{docroot}"
 default_min_devcount = 1
 "#,

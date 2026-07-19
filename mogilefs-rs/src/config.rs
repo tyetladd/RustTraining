@@ -27,6 +27,11 @@ pub struct Config {
     #[serde(default = "default_storage_port")]
     pub storage_port: u16,
 
+    #[serde(default = "default_s3_ip")]
+    pub s3_listen_ip: String,
+    #[serde(default = "default_s3_port")]
+    pub s3_port: u16,
+
     /// Root directory on disk that backs every configured device.
     /// A device with id N stores files under `<docroot>/dev<N>/...`.
     #[serde(default = "default_docroot")]
@@ -65,6 +70,14 @@ fn default_storage_ip() -> String {
 }
 fn default_storage_port() -> u16 {
     7500
+}
+fn default_s3_ip() -> String {
+    // Loopback by default: the S3 gateway ships without request signing in this
+    // phase, so binding 0.0.0.0 would expose an unauthenticated object store.
+    "127.0.0.1".to_string()
+}
+fn default_s3_port() -> u16 {
+    8333
 }
 fn default_docroot() -> String {
     "./mogdata".to_string()

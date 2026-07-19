@@ -19,13 +19,19 @@ Example `mogilefsd.toml` (all fields optional, defaults shown):
 
 ```toml
 db_dsn = "sqlite://mogilefs.db"  # or mysql://user:pass@host/db, or postgres://user:pass@host/db
-tracker_listen_ip = "0.0.0.0"
+tracker_listen_ip = "127.0.0.1"
 tracker_port = 7001              # standard MogileFS tracker port
-storage_listen_ip = "0.0.0.0"
+storage_listen_ip = "127.0.0.1"
 storage_port = 7500              # standard mogstored HTTP port
+s3_listen_ip = "127.0.0.1"
+s3_port = 8333                   # S3-compatible gateway
 docroot = "./mogdata"            # local dir backing every device's files: docroot/devN/...
 default_min_devcount = 2         # replicas for the implicit "default" class
+max_upload_bytes = 8589934592    # per-upload size cap (storage PUT and S3 PutObject)
 ```
+
+The listen addresses default to loopback because none of the three protocols are
+authenticated; put them behind a network boundary before exposing them.
 
 (`db_path = "mogilefs.db"` also works as shorthand for `db_dsn = "sqlite://mogilefs.db"` if you don't set
 `db_dsn` at all.)
@@ -68,6 +74,46 @@ syntax differs) behind a common `Db`/`Store` abstraction (`src/db/`), built on `
 | `postgres://user:pass@host/db` | PostgreSQL |
 
 All three are exercised by the same integration test suite (see Tests below).
+
+## S3-compatible gateway
+
+An in-process S3 gateway runs on `s3_port` (default 8333), letting unmodified S3
+clients (aws-cli, boto3, s3cmd, …) read and write objects that are stored in
+MogileFS underneath. It's validated end-to-end against a real boto3 client.
+
+Mapping:
+
+- **Bucket = MogileFS domain.** `CreateBucket` lazily creates the domain;
+  `ListBuckets`/`HeadBucket`/`DeleteBucket` operate on it (delete requires the
+  bucket be empty).
+- **Object bytes** live in the normal `file`/`file_on` tables — a `PutObject`
+  reuses the tracker's device selection and the same transactional `finalize_blob`
+  path as the wire protocol's `create_close`.
+- **Object metadata** MogileFS doesn't model (Content-Type, ETag, Last-Modified,
+  `x-amz-meta-*`) lives in an `s3_object` sidecar table. The **ETag is the
+  object's MD5**, computed on upload and stored in the existing `checksum` table.
+
+Implemented operations: `ListBuckets`, `CreateBucket`, `DeleteBucket`,
+`HeadBucket`, `PutObject` (streamed to disk, size-capped), `GetObject` (with
+`Range`), `HeadObject`, `DeleteObject`, `ListObjectsV2` (prefix, delimiter /
+CommonPrefixes, `max-keys`, continuation). Addressing is **path-style**, so point
+clients at the endpoint with path addressing, e.g.:
+
+```python
+import boto3
+from botocore.config import Config
+from botocore import UNSIGNED
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:8333",
+                  config=Config(signature_version=UNSIGNED,
+                                s3={"addressing_style": "path"}))
+s3.create_bucket(Bucket="photos")
+s3.put_object(Bucket="photos", Key="a/b/cat.jpg", Body=b"...", ContentType="image/jpeg")
+```
+
+This is **Phase 1**: no request signing (anonymous — hence the loopback default
+and `UNSIGNED` above), no multipart upload, no copy/versioning/ACLs. Those are
+the planned next phases; SigV4 and multipart are the two biggest remaining pieces
+for full compatibility.
 
 ## Commands implemented
 

@@ -107,6 +107,23 @@ CREATE TABLE IF NOT EXISTS file_to_queue (
     PRIMARY KEY (fid, type)
 );
 CREATE INDEX IF NOT EXISTS file_to_queue_type ON file_to_queue (type, nexttry);
+
+CREATE TABLE IF NOT EXISTS s3_bucket (
+    dmid    INTEGER PRIMARY KEY,
+    created INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS s3_object (
+    dmid            INTEGER NOT NULL,
+    dkey            TEXT NOT NULL,
+    content_type    TEXT,
+    etag            TEXT,
+    size            INTEGER NOT NULL DEFAULT 0,
+    mtime           INTEGER NOT NULL DEFAULT 0,
+    user_meta       TEXT,
+    PRIMARY KEY (dmid, dkey)
+);
+CREATE INDEX IF NOT EXISTS s3_object_key ON s3_object (dmid, dkey);
 "#;
 
 pub const SCHEMA_MYSQL: &str = r#"
@@ -214,6 +231,22 @@ CREATE TABLE IF NOT EXISTS file_to_queue (
     PRIMARY KEY (fid, type),
     KEY file_to_queue_type (type, nexttry)
 );
+
+CREATE TABLE IF NOT EXISTS s3_bucket (
+    dmid    BIGINT PRIMARY KEY,
+    created BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS s3_object (
+    dmid            BIGINT NOT NULL,
+    dkey            VARCHAR(255) NOT NULL,
+    content_type    VARCHAR(255),
+    etag            VARCHAR(255),
+    size            BIGINT NOT NULL DEFAULT 0,
+    mtime           BIGINT NOT NULL DEFAULT 0,
+    user_meta       TEXT,
+    PRIMARY KEY (dmid, dkey)
+);
 "#;
 
 pub const SCHEMA_POSTGRES: &str = r#"
@@ -319,4 +352,20 @@ CREATE TABLE IF NOT EXISTS file_to_queue (
     PRIMARY KEY (fid, type)
 );
 CREATE INDEX IF NOT EXISTS file_to_queue_type ON file_to_queue (type, nexttry);
+
+CREATE TABLE IF NOT EXISTS s3_bucket (
+    dmid    BIGINT PRIMARY KEY,
+    created BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS s3_object (
+    dmid            BIGINT NOT NULL,
+    dkey            TEXT NOT NULL,
+    content_type    TEXT,
+    etag            TEXT,
+    size            BIGINT NOT NULL DEFAULT 0,
+    mtime           BIGINT NOT NULL DEFAULT 0,
+    user_meta       TEXT,
+    PRIMARY KEY (dmid, dkey)
+);
 "#;

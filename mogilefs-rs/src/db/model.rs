@@ -142,3 +142,24 @@ pub struct QueueEntry {
     pub failcount: i64,
     pub arg: Option<String>,
 }
+
+/// S3 gateway per-object metadata that MogileFS itself doesn't model
+/// (Content-Type, ETag, last-modified, user metadata). The object bytes live in
+/// the `file`/`file_on` tables keyed by the same (dmid, dkey).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct S3Object {
+    pub dmid: i64,
+    pub dkey: String,
+    pub content_type: Option<String>,
+    pub etag: Option<String>,
+    pub size: i64,
+    pub mtime: i64,
+    pub user_meta: Option<String>,
+}
+
+/// An S3 bucket, i.e. a MogileFS domain plus its S3 creation timestamp.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct S3Bucket {
+    pub namespace: String,
+    pub created: i64,
+}

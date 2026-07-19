@@ -713,6 +713,117 @@ pub async fn all_fids(db: &Db, limit: i64) -> Result<Vec<FileRow>> {
     q_fetch_all!(db, "SELECT fid, dmid, dkey, length, classid, devcount FROM file ORDER BY fid LIMIT ?", FileRow, limit)
 }
 
+// ---- S3 gateway: bucket + object metadata ----
+
+pub async fn s3_bucket_create(db: &Db, dmid: i64) -> Result<()> {
+    let now = now_ts();
+    match &db.store {
+        Store::Sqlite(p) => {
+            sqlx::query("INSERT OR IGNORE INTO s3_bucket (dmid, created) VALUES (?, ?)").bind(dmid).bind(now).execute(p).await?;
+        }
+        Store::MySql(p) => {
+            sqlx::query("INSERT INTO s3_bucket (dmid, created) VALUES (?, ?) ON DUPLICATE KEY UPDATE dmid = dmid")
+                .bind(dmid).bind(now).execute(p).await?;
+        }
+        Store::Postgres(p) => {
+            sqlx::query("INSERT INTO s3_bucket (dmid, created) VALUES ($1, $2) ON CONFLICT DO NOTHING").bind(dmid).bind(now).execute(p).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn s3_bucket_delete(db: &Db, dmid: i64) -> Result<()> {
+    q_exec!(db, "DELETE FROM s3_bucket WHERE dmid = ?", dmid)
+}
+
+pub async fn s3_bucket_created(db: &Db, dmid: i64) -> Result<Option<i64>> {
+    let row: Option<(i64,)> = q_fetch_optional!(db, "SELECT created FROM s3_bucket WHERE dmid = ?", (i64,), dmid)?;
+    Ok(row.map(|(c,)| c))
+}
+
+pub async fn s3_list_buckets(db: &Db) -> Result<Vec<S3Bucket>> {
+    q_fetch_all!(
+        db,
+        "SELECT d.namespace AS namespace, b.created AS created \
+         FROM s3_bucket b JOIN domain d ON d.dmid = b.dmid ORDER BY d.namespace",
+        S3Bucket
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn s3_object_upsert(
+    db: &Db,
+    dmid: i64,
+    dkey: &str,
+    content_type: Option<&str>,
+    etag: &str,
+    size: i64,
+    mtime: i64,
+    user_meta: Option<&str>,
+) -> Result<()> {
+    match &db.store {
+        Store::Sqlite(p) => {
+            sqlx::query(
+                "INSERT INTO s3_object (dmid, dkey, content_type, etag, size, mtime, user_meta) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(dmid, dkey) DO UPDATE SET content_type = excluded.content_type, etag = excluded.etag, \
+                 size = excluded.size, mtime = excluded.mtime, user_meta = excluded.user_meta",
+            )
+            .bind(dmid).bind(dkey).bind(content_type).bind(etag).bind(size).bind(mtime).bind(user_meta)
+            .execute(p).await?;
+        }
+        Store::MySql(p) => {
+            sqlx::query(
+                "INSERT INTO s3_object (dmid, dkey, content_type, etag, size, mtime, user_meta) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE content_type = VALUES(content_type), etag = VALUES(etag), \
+                 size = VALUES(size), mtime = VALUES(mtime), user_meta = VALUES(user_meta)",
+            )
+            .bind(dmid).bind(dkey).bind(content_type).bind(etag).bind(size).bind(mtime).bind(user_meta)
+            .execute(p).await?;
+        }
+        Store::Postgres(p) => {
+            sqlx::query(
+                "INSERT INTO s3_object (dmid, dkey, content_type, etag, size, mtime, user_meta) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT(dmid, dkey) DO UPDATE SET content_type = excluded.content_type, etag = excluded.etag, \
+                 size = excluded.size, mtime = excluded.mtime, user_meta = excluded.user_meta",
+            )
+            .bind(dmid).bind(dkey).bind(content_type).bind(etag).bind(size).bind(mtime).bind(user_meta)
+            .execute(p).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn s3_object_get(db: &Db, dmid: i64, dkey: &str) -> Result<Option<S3Object>> {
+    q_fetch_optional!(
+        db,
+        "SELECT dmid, dkey, content_type, etag, size, mtime, user_meta FROM s3_object WHERE dmid = ? AND dkey = ?",
+        S3Object,
+        dmid,
+        dkey
+    )
+}
+
+pub async fn s3_object_delete(db: &Db, dmid: i64, dkey: &str) -> Result<()> {
+    q_exec!(db, "DELETE FROM s3_object WHERE dmid = ? AND dkey = ?", dmid, dkey)
+}
+
+/// Lists object metadata rows for a bucket, key-ordered, for ListObjectsV2.
+/// `after` is an exclusive lower bound (continuation / start-after); `limit`
+/// should be max-keys + 1 so the caller can detect truncation.
+pub async fn s3_list_objects(db: &Db, dmid: i64, prefix: &str, after: &str, limit: i64) -> Result<Vec<S3Object>> {
+    let like_pattern = format!("{}%", prefix.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
+    q_fetch_all!(
+        db,
+        "SELECT dmid, dkey, content_type, etag, size, mtime, user_meta FROM s3_object \
+         WHERE dmid = ? AND dkey LIKE ? ESCAPE '!' AND dkey > ? ORDER BY dkey LIMIT ?",
+        S3Object,
+        dmid,
+        like_pattern,
+        after,
+        limit
+    )
+}
+
 fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

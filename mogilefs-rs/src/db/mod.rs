@@ -8,6 +8,12 @@ pub mod model;
 pub mod queries;
 pub mod schema;
 
+/// Per-backend connection-pool ceiling. The tracker's query workload is light
+/// (short metadata statements), so a modest pool avoids holding many idle
+/// server connections open — which also keeps resource use sane when several
+/// instances share one database server.
+const MAX_POOL_CONNECTIONS: u32 = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Sqlite,
@@ -66,25 +72,25 @@ impl Db {
                 // sqlx defaults busy_timeout (5s) and foreign_keys (on) but not
                 // journal_mode; WAL lets readers (get_paths/list_keys) run
                 // concurrently with writers instead of serializing and timing
-                // out as "database is locked" under the 16-connection pool.
+                // out as "database is locked" under the connection pool.
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .busy_timeout(std::time::Duration::from_secs(5));
             let pool = SqlitePoolOptions::new()
-                .max_connections(16)
+                .max_connections(MAX_POOL_CONNECTIONS)
                 .connect_with(opts)
                 .await
                 .with_context(|| format!("connecting to sqlite db {dsn}"))?;
             Store::Sqlite(pool)
         } else if dsn.starts_with("mysql://") {
             let pool = MySqlPoolOptions::new()
-                .max_connections(16)
+                .max_connections(MAX_POOL_CONNECTIONS)
                 .connect(dsn)
                 .await
                 .with_context(|| "connecting to mysql".to_string())?;
             Store::MySql(pool)
         } else if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
             let pool = PgPoolOptions::new()
-                .max_connections(16)
+                .max_connections(MAX_POOL_CONNECTIONS)
                 .connect(dsn)
                 .await
                 .with_context(|| "connecting to postgres".to_string())?;

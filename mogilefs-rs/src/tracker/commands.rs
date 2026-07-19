@@ -215,30 +215,7 @@ async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, M
         return Err(MogError::no_temp_file());
     }
 
-    // Overwrite semantics: replacing an existing key retires the old fid.
-    let retire_old = queries::get_file_by_key(db, tf.dmid, key)
-        .await
-        .map_err(db_err)?
-        .map(|old| old.fid)
-        .filter(|&old_fid| old_fid != fid);
-
-    queries::finalize_file(db, fid, tf.dmid, key, actual_size, tf.classid, devid, retire_old)
-        .await
-        .map_err(db_err)?;
-
-    if let Some(old_fid) = retire_old {
-        queries::dequeue_replicate(db, old_fid).await.map_err(db_err)?;
-        queries::queue_delete(db, old_fid).await.map_err(db_err)?;
-    }
-
-    if let Some((alg, hexval)) = checksum_to_store {
-        queries::set_checksum(db, fid, &alg, &hexval).await.map_err(db_err)?;
-    }
-
-    let mindevcount = replication::resolve_class_mindevcount(db, tf.dmid, tf.classid, state.cfg.default_min_devcount as i64).await?;
-    if mindevcount > 1 {
-        queries::queue_replicate(db, fid, Some(devid)).await.map_err(db_err)?;
-    }
+    super::store_ops::finalize_blob(state, fid, tf.dmid, key, tf.classid, devid, actual_size, checksum_to_store).await?;
 
     Ok(Reply::new())
 }

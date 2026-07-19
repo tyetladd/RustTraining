@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod protocol;
 pub mod replication;
+pub mod store_ops;
 pub mod workers;
 
 use crate::config::Config;

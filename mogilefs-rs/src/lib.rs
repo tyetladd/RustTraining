@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod s3;
 pub mod storage;
 pub mod tracker;
 pub mod util;
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 pub struct ServerHandle {
     pub tracker_addr: SocketAddr,
     pub storage_addr: SocketAddr,
+    pub s3_addr: SocketAddr,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -45,6 +47,9 @@ pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
     let storage_listener = TcpListener::bind((cfg.storage_listen_ip.as_str(), cfg.storage_port)).await?;
     let storage_addr = storage_listener.local_addr()?;
 
+    let s3_listener = TcpListener::bind((cfg.s3_listen_ip.as_str(), cfg.s3_port)).await?;
+    let s3_addr = s3_listener.local_addr()?;
+
     let mut tasks = Vec::new();
 
     let s = state.clone();
@@ -56,6 +61,13 @@ pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
     tasks.push(tokio::spawn(async move {
         if let Err(e) = storage::serve(storage_listener, s).await {
             tracing::error!("storage server error: {e:#}");
+        }
+    }));
+
+    let s = state.clone();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = s3::serve(s3_listener, s).await {
+            tracing::error!("s3 gateway error: {e:#}");
         }
     }));
 
@@ -84,11 +96,14 @@ pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
         tracker::workers::run_rebalance(s).await;
     }));
 
-    tracing::info!("tracker listening on {tracker_addr}, storage listening on {storage_addr}");
+    tracing::info!(
+        "tracker on {tracker_addr}, storage on {storage_addr}, s3 gateway on {s3_addr}"
+    );
 
     Ok(ServerHandle {
         tracker_addr,
         storage_addr,
+        s3_addr,
         tasks,
     })
 }
