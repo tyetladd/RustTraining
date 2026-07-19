@@ -1,10 +1,10 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Domain {
     pub dmid: i64,
     pub namespace: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Class {
     pub dmid: i64,
     pub classid: i64,
@@ -37,7 +37,7 @@ impl HostStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Host {
     pub hostid: i64,
     pub hostname: String,
@@ -85,7 +85,7 @@ impl DeviceStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Device {
     pub devid: i64,
     pub hostid: i64,
@@ -95,7 +95,7 @@ pub struct Device {
     pub mb_used: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FileRow {
     pub fid: i64,
     pub dmid: i64,
@@ -105,7 +105,7 @@ pub struct FileRow {
     pub devcount: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TempfileRow {
     pub fid: i64,
     pub dmid: i64,
@@ -121,4 +121,24 @@ impl TempfileRow {
             .filter_map(|s| s.trim().parse().ok())
             .collect()
     }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FsckLogEntry {
+    pub logid: i64,
+    pub utime: i64,
+    pub fid: i64,
+    pub evcode: String,
+    pub devid: Option<i64>,
+}
+
+/// A row in the generic `file_to_queue` table (used for rebalance jobs today;
+/// mirrors the reference tracker's unified queue for maintenance workers).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct QueueEntry {
+    pub fid: i64,
+    pub devid: Option<i64>,
+    pub r#type: String,
+    pub failcount: i64,
+    pub arg: Option<String>,
 }

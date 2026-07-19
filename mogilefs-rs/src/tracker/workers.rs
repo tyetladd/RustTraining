@@ -12,8 +12,8 @@ pub async fn run_monitor(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     loop {
         interval.tick().await;
-        let Ok(conn) = state.db.conn() else { continue };
-        let Ok(devices) = queries::list_devices(&conn) else { continue };
+        let db = &state.db;
+        let Ok(devices) = queries::list_devices(db).await else { continue };
         for d in devices {
             let dir = storepath::device_root(&state.cfg.docroot, d.devid);
             if std::fs::create_dir_all(&dir).is_err() {
@@ -22,7 +22,7 @@ pub async fn run_monitor(state: Arc<AppState>) {
             let total_kb = fs4::total_space(&dir).unwrap_or(0) / 1024;
             let avail_kb = fs4::available_space(&dir).unwrap_or(0) / 1024;
             let used_kb = total_kb.saturating_sub(avail_kb);
-            let _ = queries::update_device_usage(&conn, d.devid, total_kb as i64, used_kb as i64);
+            let _ = queries::update_device_usage(db, d.devid, total_kb as i64, used_kb as i64).await;
         }
     }
 }
@@ -33,33 +33,35 @@ pub async fn run_replicate(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let Ok(conn) = state.db.conn() else { continue };
-        let Ok(pending) = queries::next_to_replicate(&conn, 20) else { continue };
+        let db = &state.db;
+        let Ok(pending) = queries::next_to_replicate(db, 20).await else { continue };
         for fid in pending {
-            let Ok(Some(file)) = queries::get_file_by_fid(&conn, fid) else {
-                let _ = queries::dequeue_replicate(&conn, fid);
+            let Ok(Some(file)) = queries::get_file_by_fid(db, fid).await else {
+                let _ = queries::dequeue_replicate(db, fid).await;
                 continue;
             };
             let Ok(min) = replication::resolve_class_mindevcount(
-                &conn,
+                db,
                 file.dmid,
                 file.classid,
                 state.cfg.default_min_devcount as i64,
-            ) else {
+            )
+            .await
+            else {
                 continue;
             };
-            let have = queries::get_devids_for_fid(&conn, fid).unwrap_or_default();
+            let have = queries::get_devids_for_fid(db, fid).await.unwrap_or_default();
             if have.len() as i64 >= min {
-                let _ = queries::dequeue_replicate(&conn, fid);
+                let _ = queries::dequeue_replicate(db, fid).await;
                 continue;
             }
             let need = (min as usize).saturating_sub(have.len());
             let Some(&src_devid) = have.first() else {
-                let _ = queries::bump_replicate_failure(&conn, fid, 30);
+                let _ = queries::bump_replicate_failure(db, fid, 30).await;
                 continue;
             };
             let src_path = storepath::fs_path(&state.cfg.docroot, src_devid, fid);
-            match replication::select_devices(&conn, need, &have) {
+            match replication::select_devices(db, need, &have).await {
                 Ok(targets) => {
                     let mut all_ok = true;
                     for t in targets {
@@ -68,20 +70,20 @@ pub async fn run_replicate(state: Arc<AppState>) {
                             let _ = std::fs::create_dir_all(parent);
                         }
                         if std::fs::copy(&src_path, &dst_path).is_ok() {
-                            let _ = queries::add_file_on(&conn, fid, t.devid);
+                            let _ = queries::add_file_on(db, fid, t.devid).await;
                         } else {
                             all_ok = false;
                         }
                     }
-                    let have_now = queries::get_devids_for_fid(&conn, fid).unwrap_or_default();
+                    let have_now = queries::get_devids_for_fid(db, fid).await.unwrap_or_default();
                     if have_now.len() as i64 >= min {
-                        let _ = queries::dequeue_replicate(&conn, fid);
+                        let _ = queries::dequeue_replicate(db, fid).await;
                     } else if !all_ok {
-                        let _ = queries::bump_replicate_failure(&conn, fid, 30);
+                        let _ = queries::bump_replicate_failure(db, fid, 30).await;
                     }
                 }
                 Err(_) => {
-                    let _ = queries::bump_replicate_failure(&conn, fid, 30);
+                    let _ = queries::bump_replicate_failure(db, fid, 30).await;
                 }
             }
         }
@@ -94,16 +96,147 @@ pub async fn run_delete(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(3));
     loop {
         interval.tick().await;
-        let Ok(conn) = state.db.conn() else { continue };
-        let Ok(pending) = queries::next_to_delete(&conn, 50) else { continue };
+        let db = &state.db;
+        let Ok(pending) = queries::next_to_delete(db, 50).await else { continue };
         for fid in pending {
-            let devids = queries::get_devids_for_fid(&conn, fid).unwrap_or_default();
+            let devids = queries::get_devids_for_fid(db, fid).await.unwrap_or_default();
             for devid in &devids {
                 let path = storepath::fs_path(&state.cfg.docroot, *devid, fid);
                 let _ = std::fs::remove_file(&path);
-                let _ = queries::remove_file_on(&conn, fid, *devid);
+                let _ = queries::remove_file_on(db, fid, *devid).await;
             }
-            let _ = queries::dequeue_delete(&conn, fid);
+            let _ = queries::dequeue_delete(db, fid).await;
+        }
+    }
+}
+
+/// When `fsck_running=1`, walks all `file` rows in fid order, verifying each
+/// still has its expected replicas on disk (and matches its stored checksum,
+/// if any), logging anomalies to `fsck_log` and re-queuing repairs.
+pub async fn run_fsck(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    const BATCH: i64 = 50;
+    loop {
+        interval.tick().await;
+        let db = &state.db;
+        let running = queries::get_setting(db, "fsck_running").await.ok().flatten().unwrap_or_default();
+        if running != "1" {
+            continue;
+        }
+        let cursor: i64 = queries::get_setting(db, "fsck_cursor")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let rows = match queries::list_fids_range(db, cursor, BATCH).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        for f in &rows {
+            let min = replication::resolve_class_mindevcount(db, f.dmid, f.classid, state.cfg.default_min_devcount as i64)
+                .await
+                .unwrap_or(1);
+            let devids = queries::get_devids_for_fid(db, f.fid).await.unwrap_or_default();
+
+            let mut live = Vec::new();
+            for devid in &devids {
+                let path = storepath::fs_path(&state.cfg.docroot, *devid, f.fid);
+                if path.exists() {
+                    live.push(*devid);
+                } else {
+                    let _ = queries::fsck_log(db, f.fid, "missing", Some(*devid)).await;
+                    let _ = queries::remove_file_on(db, f.fid, *devid).await;
+                }
+            }
+
+            if let Ok(Some((alg, hexval))) = queries::get_checksum(db, f.fid).await {
+                if let Some(&devid) = live.first() {
+                    let path = storepath::fs_path(&state.cfg.docroot, devid, f.fid);
+                    if let Ok(data) = std::fs::read(&path) {
+                        let computed = match alg.to_ascii_uppercase().as_str() {
+                            "MD5" => {
+                                use md5::{Digest, Md5};
+                                let mut h = Md5::new();
+                                h.update(&data);
+                                hex::encode(h.finalize())
+                            }
+                            "SHA1" => {
+                                use sha1::{Digest, Sha1};
+                                let mut h = Sha1::new();
+                                h.update(&data);
+                                hex::encode(h.finalize())
+                            }
+                            _ => String::new(),
+                        };
+                        if !computed.is_empty() && !computed.eq_ignore_ascii_case(&hexval) {
+                            let _ = queries::fsck_log(db, f.fid, "checksum_mismatch", Some(devid)).await;
+                        }
+                    }
+                }
+            }
+
+            if (live.len() as i64) < min {
+                let _ = queries::fsck_log(db, f.fid, "under_replicated", None).await;
+                let _ = queries::queue_replicate(db, f.fid, live.first().copied()).await;
+            }
+        }
+
+        if rows.len() < BATCH as usize {
+            // Reached the end of the fid space: pass complete.
+            let _ = queries::set_setting(db, "fsck_cursor", "0").await;
+            let _ = queries::set_setting(db, "fsck_running", "0").await;
+        } else {
+            let next_cursor = rows.last().map(|f| f.fid + 1).unwrap_or(cursor);
+            let _ = queries::set_setting(db, "fsck_cursor", &next_cursor.to_string()).await;
+        }
+    }
+}
+
+/// When `rebal_running=1`, drains the `file_to_queue` "rebalance" queue
+/// (seeded by `rebalance_start`), moving each fid's copy off its source
+/// device onto a less-utilized one without changing its replica count.
+pub async fn run_rebalance(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let db = &state.db;
+        let running = queries::get_setting(db, "rebal_running").await.ok().flatten().unwrap_or_default();
+        if running != "1" {
+            continue;
+        }
+        let Ok(batch) = queries::queue_next(db, "rebalance", 10).await else { continue };
+        if batch.is_empty() {
+            let _ = queries::set_setting(db, "rebal_running", "0").await;
+            continue;
+        }
+        for entry in batch {
+            let Some(src_devid) = entry.devid else {
+                let _ = queries::queue_remove(db, entry.fid, "rebalance").await;
+                continue;
+            };
+            let existing = queries::get_devids_for_fid(db, entry.fid).await.unwrap_or_default();
+            match replication::select_devices(db, 1, &existing).await {
+                Ok(targets) if !targets.is_empty() => {
+                    let dst_devid = targets[0].devid;
+                    let src_path = storepath::fs_path(&state.cfg.docroot, src_devid, entry.fid);
+                    let dst_path = storepath::fs_path(&state.cfg.docroot, dst_devid, entry.fid);
+                    if let Some(parent) = dst_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::copy(&src_path, &dst_path).is_ok() {
+                        let _ = queries::add_file_on(db, entry.fid, dst_devid).await;
+                        let _ = std::fs::remove_file(&src_path);
+                        let _ = queries::remove_file_on(db, entry.fid, src_devid).await;
+                    }
+                    let _ = queries::queue_remove(db, entry.fid, "rebalance").await;
+                }
+                _ => {
+                    let _ = queries::queue_bump_failure(db, entry.fid, "rebalance", 30).await;
+                }
+            }
         }
     }
 }

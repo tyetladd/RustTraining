@@ -3,7 +3,7 @@ use super::replication::{self, select_devices};
 use super::AppState;
 use crate::db::model::{Device, DeviceStatus, Host, HostStatus};
 use crate::db::queries;
-use crate::db::Conn;
+use crate::db::Db;
 use crate::error::MogError;
 use crate::storage::path as storepath;
 use std::sync::Arc;
@@ -16,20 +16,22 @@ fn req<'a>(args: &'a Args, name: &str) -> Option<&'a str> {
     args.get(name).map(|s| s.as_str()).filter(|s| !s.is_empty())
 }
 
-fn resolve_domain(conn: &Conn, args: &Args) -> Result<crate::db::model::Domain, MogError> {
+async fn resolve_domain(db: &Db, args: &Args) -> Result<crate::db::model::Domain, MogError> {
     let name = req(args, "domain").ok_or_else(MogError::no_domain)?;
-    queries::get_domain_by_name(conn, name)
+    queries::get_domain_by_name(db, name)
+        .await
         .map_err(db_err)?
         .ok_or_else(MogError::unreg_domain)
 }
 
 /// Resolves the `class` arg to a classid, treating missing/empty/"default" as
 /// the implicit classid 0 (mirrors real MogileFS's implicit default class).
-fn resolve_class(conn: &Conn, dmid: i64, class_arg: Option<&str>) -> Result<i64, MogError> {
+async fn resolve_class(db: &Db, dmid: i64, class_arg: Option<&str>) -> Result<i64, MogError> {
     match class_arg {
         None | Some("") | Some("default") => Ok(0),
         Some(name) => {
-            let class = queries::get_class_by_name(conn, dmid, name)
+            let class = queries::get_class_by_name(db, dmid, name)
+                .await
                 .map_err(db_err)?
                 .ok_or_else(MogError::unreg_class)?;
             Ok(class.classid)
@@ -48,34 +50,48 @@ pub async fn dispatch(state: &Arc<AppState>, cmd: &str, args: &Args) -> Result<R
         "noop" | "clear_cache" | "do_monitor_round" => Ok(Reply::new()),
         "sleep" => cmd_sleep(args).await,
 
-        "create_open" => cmd_create_open(state, args),
-        "create_close" => cmd_create_close(state, args),
-        "get_paths" => cmd_get_paths(state, args),
-        "get_domains" => cmd_get_domains(state, args),
-        "list_keys" => cmd_list_keys(state, args),
-        "delete" => cmd_delete(state, args),
-        "rename" => cmd_rename(state, args),
-        "list_fids" => cmd_list_fids(state, args),
-        "file_info" => cmd_file_info(state, args),
-        "replicate_now" => cmd_replicate_now(state, args),
+        "create_open" => cmd_create_open(state, args).await,
+        "create_close" => cmd_create_close(state, args).await,
+        "get_paths" => cmd_get_paths(state, args).await,
+        "get_domains" => cmd_get_domains(state, args).await,
+        "list_keys" => cmd_list_keys(state, args).await,
+        "delete" => cmd_delete(state, args).await,
+        "rename" => cmd_rename(state, args).await,
+        "list_fids" => cmd_list_fids(state, args).await,
+        "file_info" => cmd_file_info(state, args).await,
+        "replicate_now" => cmd_replicate_now(state, args).await,
 
-        "set_weight" => cmd_set_weight(state, args),
-        "set_state" => cmd_set_state(state, args),
-        "get_hosts" => cmd_get_hosts(state, args),
-        "get_devices" => cmd_get_devices(state, args),
+        "set_weight" => cmd_set_weight(state, args).await,
+        "set_state" => cmd_set_state(state, args).await,
+        "get_hosts" => cmd_get_hosts(state, args).await,
+        "get_devices" => cmd_get_devices(state, args).await,
 
-        "create_domain" => cmd_create_domain(state, args),
-        "delete_domain" => cmd_delete_domain(state, args),
-        "create_class" => cmd_create_class(state, args),
-        "update_class" | "updateclass" => cmd_update_class(state, args),
-        "delete_class" => cmd_delete_class(state, args),
-        "create_host" => cmd_create_host(state, args),
-        "update_host" => cmd_update_host(state, args),
-        "delete_host" => cmd_delete_host(state, args),
-        "create_device" => cmd_create_device(state, args),
+        "create_domain" => cmd_create_domain(state, args).await,
+        "delete_domain" => cmd_delete_domain(state, args).await,
+        "create_class" => cmd_create_class(state, args).await,
+        "update_class" | "updateclass" => cmd_update_class(state, args).await,
+        "delete_class" => cmd_delete_class(state, args).await,
+        "create_host" => cmd_create_host(state, args).await,
+        "update_host" => cmd_update_host(state, args).await,
+        "delete_host" => cmd_delete_host(state, args).await,
+        "create_device" => cmd_create_device(state, args).await,
 
-        "server_setting" | "server_settings" => cmd_server_setting(state, args),
-        "set_server_setting" => cmd_set_server_setting(state, args),
+        "server_setting" | "server_settings" => cmd_server_setting(state, args).await,
+        "set_server_setting" => cmd_set_server_setting(state, args).await,
+
+        "httpcopy" => cmd_httpcopy(state, args).await,
+        "edit_file" => cmd_edit_file(state, args).await,
+
+        "fsck_start" => cmd_fsck_start(state, args).await,
+        "fsck_stop" => cmd_fsck_stop(state, args).await,
+        "fsck_reset" => cmd_fsck_reset(state, args).await,
+        "fsck_clearlog" => cmd_fsck_clearlog(state, args).await,
+        "fsck_getlog" => cmd_fsck_getlog(state, args).await,
+        "fsck_status" => cmd_fsck_status(state, args).await,
+
+        "rebalance_start" => cmd_rebalance_start(state, args).await,
+        "rebalance_stop" => cmd_rebalance_stop(state, args).await,
+        "rebalance_status" => cmd_rebalance_status(state, args).await,
 
         _ => Err(MogError::unknown_command()),
     }
@@ -91,27 +107,27 @@ async fn cmd_sleep(args: &Args) -> Result<Reply, MogError> {
 
 // ---------------- create_open / create_close ----------------
 
-fn cmd_create_open(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
-    let classid = resolve_class(&conn, dom.dmid, req(args, "class"))?;
+async fn cmd_create_open(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
+    let classid = resolve_class(db, dom.dmid, req(args, "class")).await?;
     let key = req(args, "key").ok_or_else(MogError::no_key)?;
     let multi_dest = args.get("multi_dest").map(|v| v == "1").unwrap_or(false);
     let want = if multi_dest { 3 } else { 1 };
 
-    let candidates = select_devices(&conn, want, &[])?;
+    let candidates = select_devices(db, want, &[]).await?;
 
     let fid = if let Some(fid_str) = req(args, "fid") {
         let f: i64 = fid_str.parse().map_err(|_| MogError::bad_params_msg("invalid fid"))?;
-        if queries::tempfile_or_file_fid_exists(&conn, f).map_err(db_err)? {
+        if queries::tempfile_or_file_fid_exists(db, f).await.map_err(db_err)? {
             return Err(MogError::fid_in_use());
         }
         let devids_csv = candidates.iter().map(|c| c.devid.to_string()).collect::<Vec<_>>().join(",");
-        queries::create_tempfile_with_fid(&conn, f, dom.dmid, Some(key), classid, &devids_csv).map_err(db_err)?;
+        queries::create_tempfile_with_fid(db, f, dom.dmid, Some(key), classid, &devids_csv).await.map_err(db_err)?;
         f
     } else {
         let devids_csv = candidates.iter().map(|c| c.devid.to_string()).collect::<Vec<_>>().join(",");
-        queries::create_tempfile(&conn, dom.dmid, Some(key), classid, &devids_csv).map_err(db_err)?
+        queries::create_tempfile(db, dom.dmid, Some(key), classid, &devids_csv).await.map_err(db_err)?
     };
 
     let mut reply = Reply::new();
@@ -131,14 +147,14 @@ fn cmd_create_open(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError
     Ok(reply)
 }
 
-fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let fid: i64 = req(args, "fid").ok_or_else(MogError::no_fid)?.parse().map_err(|_| MogError::bad_params_msg("invalid fid"))?;
     let devid: i64 = req(args, "devid").ok_or_else(MogError::no_devid)?.parse().map_err(|_| MogError::bad_params_msg("invalid devid"))?;
     let path_arg = req(args, "path").ok_or_else(MogError::no_path)?;
 
-    let tf = queries::get_tempfile(&conn, fid).map_err(db_err)?.ok_or_else(MogError::no_temp_file)?;
-    queries::delete_tempfile(&conn, fid).map_err(db_err)?;
+    let tf = queries::get_tempfile(db, fid).await.map_err(db_err)?.ok_or_else(MogError::no_temp_file)?;
+    queries::delete_tempfile(db, fid).await.map_err(db_err)?;
 
     if !tf.devid_list().contains(&devid) {
         return Err(MogError::invalid_destdev());
@@ -191,24 +207,24 @@ fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogErro
                 return Err(MogError::checksum_mismatch());
             }
         }
-        queries::set_checksum(&conn, fid, alg, hexval).map_err(db_err)?;
+        queries::set_checksum(db, fid, alg, hexval).await.map_err(db_err)?;
     }
 
     // Overwrite semantics: replacing an existing key retires the old fid.
-    if let Some(old) = queries::get_file_by_key(&conn, tf.dmid, key).map_err(db_err)? {
+    if let Some(old) = queries::get_file_by_key(db, tf.dmid, key).await.map_err(db_err)? {
         if old.fid != fid {
-            queries::delete_file_row(&conn, old.fid).map_err(db_err)?;
-            queries::dequeue_replicate(&conn, old.fid).map_err(db_err)?;
-            queries::queue_delete(&conn, old.fid).map_err(db_err)?;
+            queries::delete_file_row(db, old.fid).await.map_err(db_err)?;
+            queries::dequeue_replicate(db, old.fid).await.map_err(db_err)?;
+            queries::queue_delete(db, old.fid).await.map_err(db_err)?;
         }
     }
 
-    queries::insert_file(&conn, fid, tf.dmid, key, actual_size, tf.classid).map_err(db_err)?;
-    queries::add_file_on(&conn, fid, devid).map_err(db_err)?;
+    queries::insert_file(db, fid, tf.dmid, key, actual_size, tf.classid).await.map_err(db_err)?;
+    queries::add_file_on(db, fid, devid).await.map_err(db_err)?;
 
-    let mindevcount = replication::resolve_class_mindevcount(&conn, tf.dmid, tf.classid, state.cfg.default_min_devcount as i64)?;
+    let mindevcount = replication::resolve_class_mindevcount(db, tf.dmid, tf.classid, state.cfg.default_min_devcount as i64).await?;
     if mindevcount > 1 {
-        queries::queue_replicate(&conn, fid, Some(devid)).map_err(db_err)?;
+        queries::queue_replicate(db, fid, Some(devid)).await.map_err(db_err)?;
     }
 
     Ok(Reply::new())
@@ -216,20 +232,20 @@ fn cmd_create_close(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogErro
 
 // ---------------- get_paths ----------------
 
-fn cmd_get_paths(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_get_paths(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let key = req(args, "key").ok_or_else(MogError::no_key)?;
-    let file = queries::get_file_by_key(&conn, dom.dmid, key).map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
+    let file = queries::get_file_by_key(db, dom.dmid, key).await.map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
 
     let pathcount: usize = args.get("pathcount").and_then(|s| s.parse().ok()).unwrap_or(2).max(2);
     let noverify = args.get("noverify").map(|v| v == "1").unwrap_or(false);
 
-    let devids = queries::get_devids_for_fid(&conn, file.fid).map_err(db_err)?;
+    let devids = queries::get_devids_for_fid(db, file.fid).await.map_err(db_err)?;
     let mut pairs: Vec<DevHost> = Vec::new();
     for devid in &devids {
-        if let Ok(Some(dev)) = queries::get_device(&conn, *devid) {
-            if let Ok(Some(host)) = queries::get_host(&conn, dev.hostid) {
+        if let Ok(Some(dev)) = queries::get_device(db, *devid).await {
+            if let Ok(Some(host)) = queries::get_host(db, dev.hostid).await {
                 pairs.push((dev, host));
             }
         }
@@ -276,15 +292,15 @@ fn cmd_get_paths(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> 
 
 // ---------------- get_domains / list_keys / delete / rename / list_fids / file_info ----------------
 
-fn cmd_get_domains(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let domains = queries::list_domains(&conn).map_err(db_err)?;
+async fn cmd_get_domains(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let domains = queries::list_domains(db).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("domains".into(), domains.len().to_string());
     for (i, dom) in domains.iter().enumerate() {
         let n = i + 1;
         reply.insert(format!("domain{n}"), dom.namespace.clone());
-        let classes = queries::list_classes(&conn, dom.dmid).map_err(db_err)?;
+        let classes = queries::list_classes(db, dom.dmid).await.map_err(db_err)?;
         reply.insert(format!("domain{n}classes"), classes.len().to_string());
         for (j, c) in classes.iter().enumerate() {
             let m = j + 1;
@@ -295,14 +311,14 @@ fn cmd_get_domains(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogErro
     Ok(reply)
 }
 
-fn cmd_list_keys(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_list_keys(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let prefix = args.get("prefix").map(|s| s.as_str()).unwrap_or("");
     let after = req(args, "after");
     let limit: i64 = args.get("limit").and_then(|s| s.parse().ok()).unwrap_or(1000).clamp(1, 1000);
 
-    let rows = queries::list_keys(&conn, dom.dmid, prefix, after, limit).map_err(db_err)?;
+    let rows = queries::list_keys(db, dom.dmid, prefix, after, limit).await.map_err(db_err)?;
     if rows.is_empty() {
         return Err(MogError::none_match());
     }
@@ -317,41 +333,41 @@ fn cmd_list_keys(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> 
     Ok(reply)
 }
 
-fn cmd_delete(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_delete(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let key = req(args, "key").ok_or_else(MogError::no_key)?;
-    let file = queries::get_file_by_key(&conn, dom.dmid, key).map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
-    queries::delete_file_row(&conn, file.fid).map_err(db_err)?;
-    queries::dequeue_replicate(&conn, file.fid).map_err(db_err)?;
-    queries::queue_delete(&conn, file.fid).map_err(db_err)?;
+    let file = queries::get_file_by_key(db, dom.dmid, key).await.map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
+    queries::delete_file_row(db, file.fid).await.map_err(db_err)?;
+    queries::dequeue_replicate(db, file.fid).await.map_err(db_err)?;
+    queries::queue_delete(db, file.fid).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_rename(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_rename(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let from_key = req(args, "from_key").ok_or_else(MogError::no_key)?;
     let to_key = req(args, "to_key").ok_or_else(MogError::no_key)?;
-    let file = queries::get_file_by_key(&conn, dom.dmid, from_key).map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
-    if queries::get_file_by_key(&conn, dom.dmid, to_key).map_err(db_err)?.is_some() {
+    let file = queries::get_file_by_key(db, dom.dmid, from_key).await.map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
+    if queries::get_file_by_key(db, dom.dmid, to_key).await.map_err(db_err)?.is_some() {
         return Err(MogError::key_exists());
     }
-    queries::rename_file_key(&conn, dom.dmid, file.fid, to_key).map_err(db_err)?;
+    queries::rename_file_key(db, dom.dmid, file.fid, to_key).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_list_fids(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_list_fids(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let from: i64 = args.get("from").and_then(|s| s.parse().ok()).unwrap_or(1).max(0);
     let count: i64 = args.get("to").and_then(|s| s.parse().ok()).unwrap_or(100).clamp(1, 500);
-    let rows = queries::list_fids_range(&conn, from, count).map_err(db_err)?;
+    let rows = queries::list_fids_range(db, from, count).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("fid_count".into(), rows.len().to_string());
     for (i, f) in rows.iter().enumerate() {
         let n = i + 1;
-        let dom_name = queries::get_domain_by_id(&conn, f.dmid).map_err(db_err)?.map(|d| d.namespace).unwrap_or_default();
-        let cls_name = replication::class_name(&conn, f.dmid, f.classid)?;
+        let dom_name = queries::get_domain_by_id(db, f.dmid).await.map_err(db_err)?.map(|d| d.namespace).unwrap_or_default();
+        let cls_name = replication::class_name(db, f.dmid, f.classid).await?;
         reply.insert(format!("fid_{n}_fid"), f.fid.to_string());
         reply.insert(format!("fid_{n}_domain"), dom_name);
         reply.insert(format!("fid_{n}_class"), cls_name);
@@ -362,32 +378,32 @@ fn cmd_list_fids(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> 
     Ok(reply)
 }
 
-fn cmd_file_info(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_file_info(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let key = req(args, "key").ok_or_else(MogError::no_key)?;
-    let file = queries::get_file_by_key(&conn, dom.dmid, key).map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
+    let file = queries::get_file_by_key(db, dom.dmid, key).await.map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
 
     let mut reply = Reply::new();
     reply.insert("fid".into(), file.fid.to_string());
     reply.insert("domain".into(), dom.namespace.clone());
-    reply.insert("class".into(), replication::class_name(&conn, dom.dmid, file.classid)?);
+    reply.insert("class".into(), replication::class_name(db, dom.dmid, file.classid).await?);
     reply.insert("key".into(), file.dkey.clone());
     reply.insert("length".into(), file.length.unwrap_or(0).to_string());
     reply.insert("devcount".into(), file.devcount.to_string());
     if args.get("devices").map(|v| v == "1").unwrap_or(false) {
-        let devids = queries::get_devids_for_fid(&conn, file.fid).map_err(db_err)?;
+        let devids = queries::get_devids_for_fid(db, file.fid).await.map_err(db_err)?;
         reply.insert("devids".into(), devids.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
     }
-    if let Some((alg, hex)) = queries::get_checksum(&conn, file.fid).map_err(db_err)? {
+    if let Some((alg, hex)) = queries::get_checksum(db, file.fid).await.map_err(db_err)? {
         reply.insert("checksum".into(), format!("{alg}:{hex}"));
     }
     Ok(reply)
 }
 
-fn cmd_replicate_now(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let pending = queries::next_to_replicate(&conn, 100000).map_err(db_err)?;
+async fn cmd_replicate_now(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let pending = queries::next_to_replicate(db, 100000).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("count".into(), pending.len().to_string());
     Ok(reply)
@@ -395,27 +411,27 @@ fn cmd_replicate_now(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogEr
 
 // ---------------- device / host admin ----------------
 
-fn cmd_set_weight(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_set_weight(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let hostname = req(args, "host").ok_or_else(MogError::bad_params)?;
     let devid: i64 = req(args, "device").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
     let weight: i64 = req(args, "weight").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
-    let host = queries::get_host_by_name(&conn, hostname).map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
-    let dev = queries::get_device(&conn, devid).map_err(db_err)?.ok_or_else(MogError::no_device)?;
+    let host = queries::get_host_by_name(db, hostname).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    let dev = queries::get_device(db, devid).await.map_err(db_err)?.ok_or_else(MogError::no_device)?;
     if dev.hostid != host.hostid {
         return Err(MogError::host_mismatch());
     }
-    queries::update_device_weight(&conn, devid, weight).map_err(db_err)?;
+    queries::update_device_weight(db, devid, weight).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_set_state(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_set_state(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let hostname = req(args, "host").ok_or_else(MogError::bad_params)?;
     let devid: i64 = req(args, "device").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
     let new_state = req(args, "state").ok_or_else(MogError::bad_params)?;
-    let host = queries::get_host_by_name(&conn, hostname).map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
-    let dev = queries::get_device(&conn, devid).map_err(db_err)?.ok_or_else(MogError::no_device)?;
+    let host = queries::get_host_by_name(db, hostname).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    let dev = queries::get_device(db, devid).await.map_err(db_err)?.ok_or_else(MogError::no_device)?;
     if dev.hostid != host.hostid {
         return Err(MogError::host_mismatch());
     }
@@ -424,14 +440,14 @@ fn cmd_set_state(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> 
     if current == Some(DeviceStatus::Dead) && parsed == DeviceStatus::Alive {
         return Err(MogError::state_too_high());
     }
-    queries::update_device_status(&conn, devid, parsed.as_str()).map_err(db_err)?;
+    queries::update_device_status(db, devid, parsed.as_str()).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_get_hosts(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_get_hosts(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let filter: Option<i64> = args.get("hostid").and_then(|s| s.parse().ok());
-    let hosts: Vec<Host> = queries::list_hosts(&conn).map_err(db_err)?.into_iter().filter(|h| filter.map(|f| f == h.hostid).unwrap_or(true)).collect();
+    let hosts: Vec<Host> = queries::list_hosts(db).await.map_err(db_err)?.into_iter().filter(|h| filter.map(|f| f == h.hostid).unwrap_or(true)).collect();
     let mut reply = Reply::new();
     reply.insert("hosts".into(), hosts.len().to_string());
     for (i, h) in hosts.iter().enumerate() {
@@ -446,10 +462,10 @@ fn cmd_get_hosts(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> 
     Ok(reply)
 }
 
-fn cmd_get_devices(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_get_devices(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let filter: Option<i64> = args.get("devid").and_then(|s| s.parse().ok());
-    let devs: Vec<Device> = queries::list_devices(&conn).map_err(db_err)?.into_iter().filter(|d| filter.map(|f| f == d.devid).unwrap_or(true)).collect();
+    let devs: Vec<Device> = queries::list_devices(db).await.map_err(db_err)?.into_iter().filter(|d| filter.map(|f| f == d.devid).unwrap_or(true)).collect();
     let mut reply = Reply::new();
     reply.insert("devices".into(), devs.len().to_string());
     for (i, d) in devs.iter().enumerate() {
@@ -466,34 +482,31 @@ fn cmd_get_devices(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError
 
 // ---------------- domain / class / host / device CRUD ----------------
 
-fn cmd_create_domain(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_create_domain(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let name = req(args, "domain").ok_or_else(MogError::no_domain)?;
-    if queries::get_domain_by_name(&conn, name).map_err(db_err)?.is_some() {
+    if queries::get_domain_by_name(db, name).await.map_err(db_err)?.is_some() {
         return Err(MogError::domain_exists());
     }
-    queries::create_domain(&conn, name).map_err(db_err)?;
+    queries::create_domain(db, name).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("domain".into(), name.to_string());
     Ok(reply)
 }
 
-fn cmd_delete_domain(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
-    let has_files: i64 = conn
-        .query_row("SELECT COUNT(*) FROM file WHERE dmid = ?1", [dom.dmid], |r| r.get(0))
-        .map_err(|e| MogError::db_msg(e.to_string()))?;
-    if has_files > 0 {
+async fn cmd_delete_domain(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
+    if queries::count_files_in_domain(db, dom.dmid).await.map_err(db_err)? > 0 {
         return Err(MogError::domain_has_files());
     }
-    queries::delete_domain(&conn, dom.dmid).map_err(db_err)?;
+    queries::delete_domain(db, dom.dmid).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_create_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_create_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let name = req(args, "class").ok_or_else(MogError::no_class)?;
     let mindevcount: i64 = args
         .get("mindevcount")
@@ -502,10 +515,10 @@ fn cmd_create_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogErro
     if mindevcount < 1 {
         return Err(MogError::invalid_mindevcount());
     }
-    if queries::get_class_by_name(&conn, dom.dmid, name).map_err(db_err)?.is_some() {
+    if queries::get_class_by_name(db, dom.dmid, name).await.map_err(db_err)?.is_some() {
         return Err(MogError::class_exists());
     }
-    let classid = queries::create_class(&conn, dom.dmid, name, mindevcount).map_err(db_err)?;
+    let classid = queries::create_class(db, dom.dmid, name, mindevcount).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("class".into(), name.to_string());
     reply.insert("classid".into(), classid.to_string());
@@ -513,50 +526,43 @@ fn cmd_create_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogErro
     Ok(reply)
 }
 
-fn cmd_update_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_update_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let name = req(args, "class").ok_or_else(MogError::no_class)?;
-    let class = queries::get_class_by_name(&conn, dom.dmid, name).map_err(db_err)?.ok_or_else(MogError::class_not_found)?;
+    let class = queries::get_class_by_name(db, dom.dmid, name).await.map_err(db_err)?.ok_or_else(MogError::class_not_found)?;
     let mindevcount: i64 = req(args, "mindevcount").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
     if mindevcount < 1 {
         return Err(MogError::invalid_mindevcount());
     }
-    queries::update_class_mindevcount(&conn, dom.dmid, class.classid, mindevcount).map_err(db_err)?;
+    queries::update_class_mindevcount(db, dom.dmid, class.classid, mindevcount).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_delete_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
-    let dom = resolve_domain(&conn, args)?;
+async fn cmd_delete_class(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
     let name = req(args, "class").ok_or_else(MogError::no_class)?;
-    let class = queries::get_class_by_name(&conn, dom.dmid, name).map_err(db_err)?.ok_or_else(MogError::class_not_found)?;
-    let has_files: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file WHERE dmid = ?1 AND classid = ?2",
-            [dom.dmid, class.classid],
-            |r| r.get(0),
-        )
-        .map_err(|e| MogError::db_msg(e.to_string()))?;
-    if has_files > 0 {
+    let class = queries::get_class_by_name(db, dom.dmid, name).await.map_err(db_err)?.ok_or_else(MogError::class_not_found)?;
+    if queries::count_files_in_class(db, dom.dmid, class.classid).await.map_err(db_err)? > 0 {
         return Err(MogError::class_has_files());
     }
-    queries::delete_class(&conn, dom.dmid, class.classid).map_err(db_err)?;
+    queries::delete_class(db, dom.dmid, class.classid).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_create_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_create_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let name = req(args, "host").ok_or_else(MogError::no_host)?;
-    if queries::get_host_by_name(&conn, name).map_err(db_err)?.is_some() {
+    if queries::get_host_by_name(db, name).await.map_err(db_err)?.is_some() {
         return Err(MogError::host_exists());
     }
     let ip = req(args, "ip").ok_or_else(MogError::no_ip)?;
     let port: i64 = req(args, "port").ok_or_else(MogError::no_port)?.parse().map_err(|_| MogError::bad_params())?;
-    let hostid = queries::create_host(&conn, name, Some(ip), port).map_err(db_err)?;
+    let hostid = queries::create_host(db, name, Some(ip), port).await.map_err(db_err)?;
     if let Some(status) = req(args, "status") {
         if HostStatus::parse(status).is_some() {
-            queries::update_host_status(&conn, hostid, status).map_err(db_err)?;
+            queries::update_host_status(db, hostid, status).await.map_err(db_err)?;
         }
     }
     let mut reply = Reply::new();
@@ -564,49 +570,47 @@ fn cmd_create_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError
     Ok(reply)
 }
 
-fn cmd_update_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_update_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let name = req(args, "host").ok_or_else(MogError::no_host)?;
-    let host = queries::get_host_by_name(&conn, name).map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    let host = queries::get_host_by_name(db, name).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
     if let Some(ip) = req(args, "ip") {
-        conn.execute("UPDATE host SET hostip = ?2 WHERE hostid = ?1", rusqlite::params![host.hostid, ip])
-            .map_err(|e| MogError::db_msg(e.to_string()))?;
+        queries::update_host_ip(db, host.hostid, ip).await.map_err(db_err)?;
     }
     if let Some(port) = req(args, "port") {
         let port: i64 = port.parse().map_err(|_| MogError::bad_params())?;
-        conn.execute("UPDATE host SET http_port = ?2 WHERE hostid = ?1", rusqlite::params![host.hostid, port])
-            .map_err(|e| MogError::db_msg(e.to_string()))?;
+        queries::update_host_port(db, host.hostid, port).await.map_err(db_err)?;
     }
     if let Some(status) = req(args, "status") {
         HostStatus::parse(status).ok_or_else(MogError::unknown_state)?;
-        queries::update_host_status(&conn, host.hostid, status).map_err(db_err)?;
+        queries::update_host_status(db, host.hostid, status).await.map_err(db_err)?;
     }
     Ok(Reply::new())
 }
 
-fn cmd_delete_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_delete_host(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let name = req(args, "host").ok_or_else(MogError::no_host)?;
-    let host = queries::get_host_by_name(&conn, name).map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
-    if queries::devices_for_host(&conn, host.hostid).map_err(db_err)? > 0 {
+    let host = queries::get_host_by_name(db, name).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    if queries::devices_for_host(db, host.hostid).await.map_err(db_err)? > 0 {
         return Err(MogError::host_not_empty());
     }
-    queries::delete_host(&conn, host.hostid).map_err(db_err)?;
+    queries::delete_host(db, host.hostid).await.map_err(db_err)?;
     Ok(Reply::new())
 }
 
-fn cmd_create_device(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_create_device(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let hostname = req(args, "host").ok_or_else(MogError::no_host)?;
-    let host = queries::get_host_by_name(&conn, hostname).map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    let host = queries::get_host_by_name(db, hostname).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
     let devid: i64 = req(args, "devid").ok_or_else(MogError::no_devid)?.parse().map_err(|_| MogError::bad_params())?;
-    if queries::get_device(&conn, devid).map_err(db_err)?.is_some() {
+    if queries::get_device(db, devid).await.map_err(db_err)?.is_some() {
         return Err(MogError::device_exists());
     }
-    queries::create_device(&conn, devid, host.hostid).map_err(db_err)?;
+    queries::create_device(db, devid, host.hostid).await.map_err(db_err)?;
     if let Some(status) = req(args, "status") {
         if DeviceStatus::parse(status).is_some() {
-            queries::update_device_status(&conn, devid, status).map_err(db_err)?;
+            queries::update_device_status(db, devid, status).await.map_err(db_err)?;
         }
     }
     std::fs::create_dir_all(storepath::device_root(&state.cfg.docroot, devid)).ok();
@@ -615,16 +619,16 @@ fn cmd_create_device(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogErr
 
 // ---------------- server settings ----------------
 
-fn cmd_server_setting(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_server_setting(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     if let Some(key) = req(args, "key") {
-        let value = queries::get_setting(&conn, key).map_err(db_err)?.unwrap_or_default();
+        let value = queries::get_setting(db, key).await.map_err(db_err)?.unwrap_or_default();
         let mut reply = Reply::new();
         reply.insert("key".into(), key.to_string());
         reply.insert("value".into(), value);
         return Ok(reply);
     }
-    let all = queries::list_settings(&conn).map_err(db_err)?;
+    let all = queries::list_settings(db).await.map_err(db_err)?;
     let mut reply = Reply::new();
     reply.insert("key_count".into(), all.len().to_string());
     for (i, (k, v)) in all.iter().enumerate() {
@@ -634,10 +638,156 @@ fn cmd_server_setting(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogEr
     Ok(reply)
 }
 
-fn cmd_set_server_setting(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
-    let conn = state.db.conn().map_err(db_err)?;
+async fn cmd_set_server_setting(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
     let key = req(args, "key").ok_or_else(MogError::bad_params)?;
     let value = args.get("value").map(|s| s.as_str()).unwrap_or("");
-    queries::set_setting(&conn, key, value).map_err(db_err)?;
+    queries::set_setting(db, key, value).await.map_err(db_err)?;
     Ok(Reply::new())
+}
+
+// ---------------- httpcopy / edit_file ----------------
+
+async fn cmd_httpcopy(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let sdevid: i64 = req(args, "sdevid").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
+    let ddevid: i64 = req(args, "ddevid").ok_or_else(MogError::bad_params)?.parse().map_err(|_| MogError::bad_params())?;
+    let fid: i64 = req(args, "fid").ok_or_else(MogError::no_fid)?.parse().map_err(|_| MogError::bad_params())?;
+
+    queries::get_device(db, sdevid).await.map_err(db_err)?.ok_or_else(MogError::unknown_device)?;
+    queries::get_device(db, ddevid).await.map_err(db_err)?.ok_or_else(MogError::unknown_device)?;
+
+    let src = storepath::fs_path(&state.cfg.docroot, sdevid, fid);
+    let dst = storepath::fs_path(&state.cfg.docroot, ddevid, fid);
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::copy(&src, &dst).map_err(|e| MogError::new("copy_err", e.to_string()))?;
+    queries::add_file_on(db, fid, ddevid).await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+/// Experimental in the reference tracker too: allocates a fresh temp
+/// destination for an existing key so a client can read-modify-write it,
+/// then close over the new copy exactly like a normal `create_open`.
+async fn cmd_edit_file(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let dom = resolve_domain(db, args).await?;
+    let key = req(args, "key").ok_or_else(MogError::no_key)?;
+    let file = queries::get_file_by_key(db, dom.dmid, key).await.map_err(db_err)?.ok_or_else(MogError::unknown_key)?;
+    let old_devids = queries::get_devids_for_fid(db, file.fid).await.map_err(db_err)?;
+    let old_devid = *old_devids.first().ok_or_else(MogError::unknown_key)?;
+    let old_dev = queries::get_device(db, old_devid).await.map_err(db_err)?.ok_or_else(MogError::unknown_device)?;
+    let old_host = queries::get_host(db, old_dev.hostid).await.map_err(db_err)?.ok_or_else(MogError::unknown_host)?;
+    let oldpath = build_url(&old_host.hostip.clone().unwrap_or_default(), old_host.http_port, old_devid, file.fid);
+
+    let candidates = select_devices(db, 1, &[]).await?;
+    let devids_csv = candidates.iter().map(|c| c.devid.to_string()).collect::<Vec<_>>().join(",");
+    let new_fid = queries::create_tempfile(db, dom.dmid, Some(key), file.classid, &devids_csv).await.map_err(db_err)?;
+    let c = &candidates[0];
+    let newpath = build_url(&c.hostip, c.http_port, c.devid, new_fid);
+
+    let mut reply = Reply::new();
+    reply.insert("fid".into(), new_fid.to_string());
+    reply.insert("devid".into(), c.devid.to_string());
+    reply.insert("oldpath".into(), oldpath);
+    reply.insert("newpath".into(), newpath);
+    reply.insert("class".into(), replication::class_name(db, dom.dmid, file.classid).await?);
+    Ok(reply)
+}
+
+// ---------------- fsck ----------------
+
+async fn cmd_fsck_start(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    queries::set_setting(db, "fsck_running", "1").await.map_err(db_err)?;
+    queries::set_setting(db, "fsck_cursor", "0").await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_fsck_stop(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    queries::set_setting(db, "fsck_running", "0").await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_fsck_reset(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    queries::set_setting(db, "fsck_running", "0").await.map_err(db_err)?;
+    queries::set_setting(db, "fsck_cursor", "0").await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_fsck_clearlog(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    queries::fsck_clear_log(db).await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_fsck_getlog(state: &Arc<AppState>, args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let limit: i64 = args.get("limit").and_then(|s| s.parse().ok()).unwrap_or(100).clamp(1, 1000);
+    let entries = queries::fsck_log_entries(db, limit).await.map_err(db_err)?;
+    let mut reply = Reply::new();
+    reply.insert("row_count".into(), entries.len().to_string());
+    for (i, e) in entries.iter().enumerate() {
+        let n = i + 1;
+        reply.insert(format!("row_{n}_fid"), e.fid.to_string());
+        reply.insert(format!("row_{n}_evcode"), e.evcode.clone());
+        reply.insert(format!("row_{n}_devid"), e.devid.map(|d| d.to_string()).unwrap_or_default());
+        reply.insert(format!("row_{n}_utime"), e.utime.to_string());
+    }
+    Ok(reply)
+}
+
+async fn cmd_fsck_status(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let running = queries::get_setting(db, "fsck_running").await.map_err(db_err)?.unwrap_or_else(|| "0".to_string());
+    let log_count = queries::fsck_log_count(db).await.map_err(db_err)?;
+    let mut reply = Reply::new();
+    reply.insert("running".into(), running);
+    reply.insert("log_count".into(), log_count.to_string());
+    Ok(reply)
+}
+
+// ---------------- rebalance ----------------
+
+async fn cmd_rebalance_start(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    // Seed the queue: files on the currently most-utilized device are
+    // candidates to move to less-utilized ones.
+    let devices = queries::list_devices(db).await.map_err(db_err)?;
+    if let Some(busiest) = devices
+        .iter()
+        .filter(|d| matches!((d.mb_total, d.mb_used), (Some(t), Some(_)) if t > 0))
+        .max_by(|a, b| {
+            let ua = a.mb_used.unwrap_or(0) as f64 / a.mb_total.unwrap_or(1) as f64;
+            let ub = b.mb_used.unwrap_or(0) as f64 / b.mb_total.unwrap_or(1) as f64;
+            ua.partial_cmp(&ub).unwrap()
+        })
+    {
+        let fids: Vec<i64> = queries::get_fids_for_device(db, busiest.devid, 50).await.map_err(db_err)?;
+        for fid in fids {
+            queries::queue_add(db, fid, Some(busiest.devid), "rebalance", None).await.map_err(db_err)?;
+        }
+    }
+    queries::set_setting(db, "rebal_running", "1").await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_rebalance_stop(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    queries::set_setting(db, "rebal_running", "0").await.map_err(db_err)?;
+    queries::queue_clear(db, "rebalance").await.map_err(db_err)?;
+    Ok(Reply::new())
+}
+
+async fn cmd_rebalance_status(state: &Arc<AppState>, _args: &Args) -> Result<Reply, MogError> {
+    let db = &state.db;
+    let running = queries::get_setting(db, "rebal_running").await.map_err(db_err)?.unwrap_or_else(|| "0".to_string());
+    let queued = queries::queue_count(db, "rebalance").await.map_err(db_err)?;
+    let mut reply = Reply::new();
+    reply.insert("running".into(), running);
+    reply.insert("queued".into(), queued.to_string());
+    Ok(reply)
 }

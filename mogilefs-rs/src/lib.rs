@@ -35,8 +35,8 @@ impl Drop for ServerHandle {
 /// then returns immediately with the bound addresses.
 pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
     std::fs::create_dir_all(&cfg.docroot)?;
-    let db = db::Db::open(&cfg.db_path)?;
-    db.migrate()?;
+    let db = db::Db::open(&cfg.resolved_db_dsn()).await?;
+    db.migrate().await?;
     let state = Arc::new(tracker::AppState::new(db, cfg.clone()));
 
     let tracker_listener = TcpListener::bind((cfg.tracker_listen_ip.as_str(), cfg.tracker_port)).await?;
@@ -72,6 +72,16 @@ pub async fn spawn(cfg: config::Config) -> Result<ServerHandle> {
     let s = state.clone();
     tasks.push(tokio::spawn(async move {
         tracker::workers::run_delete(s).await;
+    }));
+
+    let s = state.clone();
+    tasks.push(tokio::spawn(async move {
+        tracker::workers::run_fsck(s).await;
+    }));
+
+    let s = state.clone();
+    tasks.push(tokio::spawn(async move {
+        tracker::workers::run_rebalance(s).await;
     }));
 
     tracing::info!("tracker listening on {tracker_addr}, storage listening on {storage_addr}");

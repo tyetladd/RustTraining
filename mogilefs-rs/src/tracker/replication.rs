@@ -4,7 +4,7 @@
 
 use crate::db::model::{Device, DeviceStatus, HostStatus};
 use crate::db::queries;
-use crate::db::Conn;
+use crate::db::Db;
 use crate::error::MogError;
 use anyhow::Result;
 use rand::seq::SliceRandom;
@@ -21,15 +21,19 @@ pub struct Candidate {
     pub percent_free: f64,
 }
 
-fn all_writable_candidates(conn: &Conn) -> Result<Vec<Candidate>> {
-    let devices: Vec<Device> = queries::list_devices(conn)?;
+fn db_err(e: anyhow::Error) -> MogError {
+    MogError::db_msg(e.to_string())
+}
+
+async fn all_writable_candidates(db: &Db) -> Result<Vec<Candidate>> {
+    let devices: Vec<Device> = queries::list_devices(db).await?;
     let mut out = Vec::new();
     for d in devices {
         let Some(status) = DeviceStatus::parse(&d.status) else { continue };
         if !status.writeable() {
             continue;
         }
-        let Some(host) = queries::get_host(conn, d.hostid)? else { continue };
+        let Some(host) = queries::get_host(db, d.hostid).await? else { continue };
         let Some(hstatus) = HostStatus::parse(&host.status) else { continue };
         if hstatus != HostStatus::Alive {
             continue;
@@ -51,10 +55,10 @@ fn all_writable_candidates(conn: &Conn) -> Result<Vec<Candidate>> {
     Ok(out)
 }
 
-pub fn select_devices(conn: &Conn, want: usize, exclude_devids: &[i64]) -> Result<Vec<Candidate>, MogError> {
-    let db_err = |e: anyhow::Error| MogError::db_msg(e.to_string());
+pub async fn select_devices(db: &Db, want: usize, exclude_devids: &[i64]) -> Result<Vec<Candidate>, MogError> {
     let exclude: HashSet<i64> = exclude_devids.iter().copied().collect();
-    let mut pool: Vec<Candidate> = all_writable_candidates(conn)
+    let mut pool: Vec<Candidate> = all_writable_candidates(db)
+        .await
         .map_err(db_err)?
         .into_iter()
         .filter(|c| !exclude.contains(&c.devid))
@@ -70,7 +74,6 @@ pub fn select_devices(conn: &Conn, want: usize, exclude_devids: &[i64]) -> Resul
 
     let mut rng = thread_rng();
     let mut chosen: Vec<Candidate> = Vec::new();
-    let mut used_hosts: HashSet<i64> = HashSet::new();
 
     // Pass 1: at most one device per host, weighted by `weight`.
     let distinct_host_pool: Vec<&Candidate> = {
@@ -82,7 +85,6 @@ pub fn select_devices(conn: &Conn, want: usize, exclude_devids: &[i64]) -> Resul
     }) {
         for c in picks {
             chosen.push((*c).clone());
-            used_hosts.insert(c.hostid);
         }
     }
 
@@ -106,23 +108,21 @@ pub fn select_devices(conn: &Conn, want: usize, exclude_devids: &[i64]) -> Resul
     Ok(chosen)
 }
 
-pub fn resolve_class_mindevcount(conn: &Conn, dmid: i64, classid: i64, default_min: i64) -> Result<i64, MogError> {
-    let db_err = |e: anyhow::Error| MogError::db_msg(e.to_string());
+pub async fn resolve_class_mindevcount(db: &Db, dmid: i64, classid: i64, default_min: i64) -> Result<i64, MogError> {
     if classid == 0 {
         return Ok(default_min);
     }
-    match queries::get_class(conn, dmid, classid).map_err(db_err)? {
+    match queries::get_class(db, dmid, classid).await.map_err(db_err)? {
         Some(c) => Ok(c.mindevcount),
         None => Ok(default_min),
     }
 }
 
-pub fn class_name(conn: &Conn, dmid: i64, classid: i64) -> Result<String, MogError> {
-    let db_err = |e: anyhow::Error| MogError::db_msg(e.to_string());
+pub async fn class_name(db: &Db, dmid: i64, classid: i64) -> Result<String, MogError> {
     if classid == 0 {
         return Ok("default".to_string());
     }
-    match queries::get_class(conn, dmid, classid).map_err(db_err)? {
+    match queries::get_class(db, dmid, classid).await.map_err(db_err)? {
         Some(c) => Ok(c.classname),
         None => Ok("default".to_string()),
     }

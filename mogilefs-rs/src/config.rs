@@ -6,7 +6,14 @@ use std::path::Path;
 /// the storage node (mogstored-equivalent), since we run both in one process.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// SQLite database file backing all tracker metadata.
+    /// Backend DSN, mirroring the real tracker's `db_dsn` config key.
+    /// Scheme selects the backend: `sqlite://path/to/file.db`,
+    /// `mysql://user:pass@host/db`, `postgres://user:pass@host/db`.
+    #[serde(default)]
+    pub db_dsn: Option<String>,
+
+    /// Legacy/shorthand SQLite path, kept for convenience: if `db_dsn` is not
+    /// set, this is used as `sqlite://<db_path>`.
     #[serde(default = "default_db_path")]
     pub db_path: String,
 
@@ -68,5 +75,14 @@ impl Config {
         let cfg: Config = toml::from_str(&text)
             .with_context(|| format!("parsing config file {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// The DSN actually used to open the store: `db_dsn` if set, else the
+    /// `db_path` shorthand turned into a `sqlite://` DSN.
+    pub fn resolved_db_dsn(&self) -> String {
+        match &self.db_dsn {
+            Some(dsn) => dsn.clone(),
+            None => format!("sqlite://{}", self.db_path),
+        }
     }
 }
