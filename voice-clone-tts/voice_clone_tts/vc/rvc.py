@@ -63,6 +63,13 @@ SLICED_DIR = "sliced_audios"
 FEATURES_DIR = "extracted"
 FILELIST = "filelist.txt"
 STAGE_DIRS = (SLICED_DIR, FEATURES_DIR, "f0", "f0_voiced")
+
+# `git clone` не тянет веса: их скачивает отдельная команда `core.py
+# prerequisites`. Без них шаг питча молча не пишет ничего, а обучение остаётся
+# без предобученной модели.
+PREDICTORS_DIR = "rvc/models/predictors"
+EMBEDDERS_DIR = "rvc/models/embedders/contentvec"
+PRETRAINEDS_DIR = "rvc/models/pretraineds"
 """generate_filelist() берёт ПЕРЕСЕЧЕНИЕ имён из этих четырёх папок.
 
 Пустая любая из них — и filelist.txt оказывается пустым, а обучение
@@ -115,6 +122,8 @@ class RVCConverter(VoiceConverter):
         self.protect = float(options.get("protect", 0.33))
         self.volume_envelope = float(options.get("volume_envelope", 1.0))
         self.python = options.get("python", sys.executable)
+        self.vocoder = options.get("vocoder", "HiFi-GAN")
+        self.prerequisites = bool(options.get("prerequisites", True))
         self.logs_dir = options.get("logs_dir")
         """Persistent parent for Applio's per-model logs (Drive, /kaggle/working…).
 
@@ -142,6 +151,49 @@ class RVCConverter(VoiceConverter):
             _, _, index = device.partition(":")
             return index or "0"
         return "-"  # Applio reads "-" as CPU
+
+    def _missing_prerequisites(self) -> list[str]:
+        """Каких весов Applio не хватает для выбранных метода и частоты."""
+        checkout = self._checkout()
+        missing: list[str] = []
+        if not any((checkout / PREDICTORS_DIR).glob("*.pt")):
+            missing.append(f"предикторы f0 ({PREDICTORS_DIR})")
+        if not any((checkout / EMBEDDERS_DIR).glob("*")):
+            missing.append(f"эмбеддер contentvec ({EMBEDDERS_DIR})")
+        generator = (
+            checkout / PRETRAINEDS_DIR / self.vocoder.lower()
+            / f"f0G{str(self.sample_rate)[:2]}k.pth"
+        )
+        if not generator.exists():
+            missing.append(
+                f"предобученная модель {self.vocoder} для {self.sample_rate} Гц "
+                f"({generator.relative_to(checkout)})"
+            )
+        return missing
+
+    def _ensure_prerequisites(self) -> None:
+        """Догрузить веса, если их нет.
+
+        Их отсутствие проявляется поздно и невнятно: питч-экстракция молча не
+        пишет ни одного файла, filelist.txt выходит пустым, а обучение
+        останавливается на «Not enough data present in the training set».
+        """
+        if not self.prerequisites:
+            return
+        missing = self._missing_prerequisites()
+        if not missing:
+            return
+        log.info("Applio не хватает весов: %s — скачиваю (это несколько ГБ)",
+                 "; ".join(missing))
+        self._core("prerequisites", label="applio prerequisites")
+
+        still_missing = self._missing_prerequisites()
+        if still_missing:
+            raise VoiceConversionError(
+                "после `core.py prerequisites` весов всё ещё нет:\n  "
+                + "\n  ".join(still_missing)
+                + "\nПроверьте доступ в интернет (на Kaggle — Internet: On) и место на диске."
+            )
 
     def _prepare_logs(self, name: str) -> Path:
         """Return Applio's logs dir for `name`, linked to persistent storage if asked."""
@@ -349,6 +401,7 @@ class RVCConverter(VoiceConverter):
         out_dir.mkdir(parents=True, exist_ok=True)
         name = name or dataset.speaker
         epochs = int(epochs or DEFAULT_EPOCHS)
+        self._ensure_prerequisites()
         logs_dir = self._prepare_logs(name)
 
         if not resume:
@@ -392,6 +445,7 @@ class RVCConverter(VoiceConverter):
             "--batch-size", self.batch_size,
             "--save-every-epoch", self.save_every_epoch,
             "--sample-rate", self.sample_rate,
+            "--vocoder", self.vocoder,
             "--gpu", self._gpu_argument(),
             label="applio train",
         )
@@ -442,10 +496,13 @@ class RVCConverter(VoiceConverter):
         transpose: int = 0,
     ) -> np.ndarray:
         self._checkout()
+        # Сначала дешёвые проверки: скачивать гигабайты ради заведомо неверного
+        # аргумента незачем.
         if model.checkpoint is None:
             raise VoiceConversionError(f"voice model '{model.name}' has no checkpoint")
         if not -24 <= transpose <= 24:
             raise VoiceConversionError(f"transpose must be within ±24 semitones, got {transpose}")
+        self._ensure_prerequisites()
 
         workdir = Path(tempfile.mkdtemp(prefix="vctts-rvc-"))
         source = workdir / "in.wav"

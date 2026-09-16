@@ -166,6 +166,15 @@ class FakeSvc:
             model_dir.mkdir(parents=True, exist_ok=True)
             (model_dir / "G_800.pth").write_bytes(b"g")
             (model_dir / "G_1600.pth").write_bytes(b"g")
+        elif step == "prerequisites":
+            if not self.skip_prerequisites:
+                for relative in ("rvc/models/predictors/rmvpe.pt",
+                                 "rvc/models/embedders/contentvec/pytorch_model.bin",
+                                 "rvc/models/pretraineds/hifi-gan/f0G40k.pth",
+                                 "rvc/models/pretraineds/hifi-gan/f0D40k.pth"):
+                    target = self.checkout / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"weights")
         elif step == "infer":
             output = Path(args[args.index("-o") + 1])
             audio_utils.save_audio(output, np.full(4410, 0.05, dtype=np.float32), 44_100)
@@ -262,7 +271,8 @@ class FakeApplio:
     """
 
     def __init__(self, checkout: Path, *, slices: int = 40, entries: int = 40,
-                 skip_dirs: tuple[str, ...] = ()):
+                 skip_dirs: tuple[str, ...] = (), skip_prerequisites: bool = False):
+        self.skip_prerequisites = skip_prerequisites
         self.checkout = checkout
         self.commands: list[list[str]] = []
         self.slices = slices
@@ -299,6 +309,15 @@ class FakeApplio:
             (logs / f"{name}.pth").write_bytes(b"w")
         elif step == "index":
             (logs / f"{name}.index").write_bytes(b"i")
+        elif step == "prerequisites":
+            if not self.skip_prerequisites:
+                for relative in ("rvc/models/predictors/rmvpe.pt",
+                                 "rvc/models/embedders/contentvec/pytorch_model.bin",
+                                 "rvc/models/pretraineds/hifi-gan/f0G40k.pth",
+                                 "rvc/models/pretraineds/hifi-gan/f0D40k.pth"):
+                    target = self.checkout / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"weights")
         elif step == "infer":
             output = Path(args[args.index("--output-path") + 1])
             audio_utils.save_audio(output, np.full(4000, 0.05, dtype=np.float32), 40_000)
@@ -318,7 +337,7 @@ def test_rvc_training_runs_the_documented_pipeline(applio, reference_wav, tmp_pa
     )
     model = RVCConverter().train(dataset, tmp_path / "voice", epochs=120)
 
-    assert [command[2] for command in runner.commands] == ["preprocess", "extract", "train", "index"]
+    assert steps(runner) == ["preprocess", "extract", "train", "index"]
     assert model.converter == "rvc"
     assert model.checkpoint.parent == tmp_path / "voice"  # copied out of the checkout
     assert model.index is not None and model.index.exists()
@@ -561,7 +580,7 @@ def test_rvc_stops_when_training_produced_no_weights(applio, reference_wav, tmp_
     message = str(excinfo.value)
     assert "no .pth weights" in message
     assert "core.py train --model-name anna" in message  # как воспроизвести
-    assert [c[2] for c in runner.commands] == ["preprocess", "extract", "train"]  # index не запускался
+    assert steps(runner) == ["preprocess", "extract", "train"]  # index не запускался
 
 
 def test_rvc_passes_failure_patterns_to_the_runner(applio, reference_wav, tmp_path, monkeypatch):
@@ -581,6 +600,11 @@ def test_rvc_passes_failure_patterns_to_the_runner(applio, reference_wav, tmp_pa
 # where the data disappears between Applio's steps
 # --------------------------------------------------------------------------
 
+def steps(runner) -> list[str]:
+    """Стадии конвейера без служебного шага скачивания весов."""
+    return [command[2] for command in runner.commands if command[2] != "prerequisites"]
+
+
 def _dataset(reference_wav, tmp_path):
     return build_training_dataset(
         reference_wav, out_dir=tmp_path / "ds", speaker="anna", max_clip_sec=2.0, min_clip_sec=0.4
@@ -593,7 +617,7 @@ def test_rvc_reports_when_preprocess_sliced_nothing(applio, reference_wav, tmp_p
 
     with pytest.raises(VoiceConversionError, match="не нарезал ни одного фрагмента"):
         RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
-    assert [c[2] for c in runner.commands] == ["preprocess"]  # extract даже не запускался
+    assert steps(runner) == ["preprocess"]  # extract даже не запускался
 
 
 def test_rvc_reports_when_extract_produced_nothing(applio, reference_wav, tmp_path, monkeypatch):
@@ -602,7 +626,7 @@ def test_rvc_reports_when_extract_produced_nothing(applio, reference_wav, tmp_pa
 
     with pytest.raises(VoiceConversionError, match="не подготовил данные"):
         RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
-    assert [c[2] for c in runner.commands] == ["preprocess", "extract"]
+    assert steps(runner) == ["preprocess", "extract"]
 
 
 def test_rvc_explains_too_little_data_for_the_batch_size(applio, reference_wav, tmp_path, monkeypatch):
@@ -626,7 +650,7 @@ def test_rvc_trains_when_there_is_enough_data(applio, reference_wav, tmp_path, m
     model = RVCConverter(batch_size=8).train(
         _dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10
     )
-    assert [c[2] for c in runner.commands] == ["preprocess", "extract", "train", "index"]
+    assert steps(runner) == ["preprocess", "extract", "train", "index"]
     assert model.checkpoint.exists()
 
 
@@ -648,7 +672,7 @@ def test_rvc_can_stop_after_preprocess(applio, reference_wav, tmp_path, monkeypa
     model = RVCConverter().train(
         _dataset(reference_wav, tmp_path), tmp_path / "voice", stop_after="preprocess"
     )
-    assert [c[2] for c in runner.commands] == ["preprocess"]
+    assert steps(runner) == ["preprocess"]
     assert model.checkpoint is None
     assert model.train_stats == {"stopped_after": "preprocess", "slices": 40}
     assert (tmp_path / "voice" / "voice_model.json").exists()
@@ -661,7 +685,7 @@ def test_rvc_can_stop_after_extract(applio, reference_wav, tmp_path, monkeypatch
     model = RVCConverter().train(
         _dataset(reference_wav, tmp_path), tmp_path / "voice", stop_after="extract"
     )
-    assert [c[2] for c in runner.commands] == ["preprocess", "extract"]
+    assert steps(runner) == ["preprocess", "extract"]
     assert model.train_stats["stopped_after"] == "extract"
     assert model.train_stats["filelist_entries"] == 40
 
@@ -692,7 +716,7 @@ def test_rvc_names_the_empty_stage_directory(applio, reference_wav, tmp_path, mo
     assert "пусто в f0, f0_voiced" in message
     assert "sliced_audios: 40" in message and "extracted: 40" in message
     assert "rmvpe" in message
-    assert [c[2] for c in runner.commands] == ["preprocess", "extract"]  # train не запускался
+    assert steps(runner) == ["preprocess", "extract"]  # train не запускался
 
 
 def test_resume_still_validates_the_prepared_data(applio, reference_wav, tmp_path, monkeypatch):
@@ -709,4 +733,56 @@ def test_resume_still_validates_the_prepared_data(applio, reference_wav, tmp_pat
     with pytest.raises(VoiceConversionError, match="f0_voiced") as excinfo:
         RVCConverter().train(dataset, tmp_path / "voice", epochs=10, resume=True)
     assert "sliced_audios: 40" in str(excinfo.value)  # видно, что уцелело
-    assert runner.commands == []  # ни одной команды: остановились на проверке
+    assert steps(runner) == []  # ни одной стадии: остановились на проверке
+
+
+# --------------------------------------------------------------------------
+# Applio ships no weights: `git clone` alone leaves it unable to train
+# --------------------------------------------------------------------------
+
+def test_rvc_downloads_missing_weights_first(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
+
+    assert runner.commands[0][2] == "prerequisites"  # до всего остального
+    assert (applio / "rvc/models/predictors/rmvpe.pt").exists()
+
+
+def test_rvc_skips_the_download_when_weights_are_there(applio, reference_wav, tmp_path, monkeypatch):
+    for relative in ("rvc/models/predictors/rmvpe.pt",
+                     "rvc/models/embedders/contentvec/pytorch_model.bin",
+                     "rvc/models/pretraineds/hifi-gan/f0G40k.pth"):
+        target = applio / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"weights")
+
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
+    assert "prerequisites" not in [command[2] for command in runner.commands]
+
+
+def test_rvc_reports_a_download_that_did_not_help(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio, skip_prerequisites=True)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    with pytest.raises(VoiceConversionError, match="весов всё ещё нет"):
+        RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
+
+
+def test_missing_weights_are_named_precisely(applio):
+    missing = RVCConverter(sample_rate=40_000)._missing_prerequisites()
+    assert any("предикторы f0" in item for item in missing)
+    assert any("contentvec" in item for item in missing)
+    assert any("f0G40k.pth" in item for item in missing)
+
+
+def test_prerequisites_can_be_disabled(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    RVCConverter(prerequisites=False).train(
+        _dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10
+    )
+    assert "prerequisites" not in [command[2] for command in runner.commands]

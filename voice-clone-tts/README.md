@@ -243,6 +243,11 @@ Silero обычно требует −8…−12 полутонов, и авто�
 | `--vc` | тулчейн | установка | заметки |
 |--------|---------|-----------|---------|
 | `rvc` (по умолчанию) | [Applio](https://github.com/IAHispano/Applio), MIT | `git clone` + `pip install -r requirements.txt`, затем `VCTTS_APPLIO_DIR=/path/to/Applio` | актуальное семейство RVC, поддерживается; ближе всего к оригиналу |
+
+Веса Applio в репозитории не лежат — их скачивает `python3 core.py prerequisites`
+(несколько гигабайт). Драйвер проверяет наличие предикторов f0, эмбеддера и
+предобученных моделей и при необходимости запускает эту команду сам; отключается
+через `--vc-option prerequisites=false`.
 | `sovits` | [so-vits-svc-fork](https://github.com/voicepaw/so-vits-svc-fork), MIT | `pip install -U so-vits-svc-fork` | ставится одной командой, но апстрим больше не развивается |
 
 Проект не тянет их за собой: драйвер запускает внешний CLI (`svc …` либо
