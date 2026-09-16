@@ -890,3 +890,13 @@ def test_existing_assets_config_is_left_alone(applio, reference_wav, tmp_path, m
 
     RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
     assert json.loads(path.read_text(encoding="utf-8"))["model_author"] == "someone"
+
+
+def test_rvc_refuses_to_convert_with_a_training_checkpoint(applio, tmp_path):
+    """A model directory can still point at G_*.pth — catch it before RVC does."""
+    checkpoint = tmp_path / "G_10800.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    model = VoiceModel(name="anna", directory=tmp_path, converter="rvc", checkpoint=checkpoint)
+
+    with pytest.raises(VoiceConversionError, match="тренировочный чекпоинт"):
+        RVCConverter().convert(np.zeros(1000, dtype=np.float32), 24_000, model)

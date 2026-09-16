@@ -33,6 +33,7 @@ import numpy as np
 
 from voice_clone_tts import audio as audio_utils
 from voice_clone_tts.vc.base import (
+    MODEL_FILE,
     STAGES,
     VoiceConversionError,
     VoiceConverter,
@@ -578,6 +579,13 @@ class RVCConverter(VoiceConverter):
         # аргумента незачем.
         if model.checkpoint is None:
             raise VoiceConversionError(f"voice model '{model.name}' has no checkpoint")
+        if model.checkpoint.name.startswith(("G_", "D_")):
+            raise VoiceConversionError(
+                f"'{model.checkpoint.name}' — тренировочный чекпоинт, а не модель для "
+                "синтеза: RVC ищет в нём ключ 'config' и падает с KeyError.\n"
+                "Нужен экспорт вида '<имя>_<эпоха>e_<шаг>s.pth' из папки logs/<имя>; "
+                f"пропишите его в поле checkpoint файла {MODEL_FILE}."
+            )
         if not -24 <= transpose <= 24:
             raise VoiceConversionError(f"transpose must be within ±24 semitones, got {transpose}")
         self._ensure_prerequisites()
