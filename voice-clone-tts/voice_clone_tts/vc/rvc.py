@@ -209,6 +209,25 @@ class RVCConverter(VoiceConverter):
         model.save()
         return model
 
+    def _pitch_hint(self) -> str:
+        """Подсказка для пустых f0: там ошибка не печатается вообще.
+
+        run_pitch_extraction() ждёт задачи через concurrent.futures.wait() и
+        не забирает результат, поэтому исключение в воркере (обычно — загрузка
+        модели предиктора) теряется, а шаг сообщает «completed».
+        """
+        checkout = self.applio_dir or Path("<Applio>")
+        return (
+            "Шаг питча ошибку не печатает: Applio ждёт воркеры через "
+            "concurrent.futures.wait() и не забирает исключение. Увидеть её можно, "
+            "загрузив предиктор в текущем процессе:\n"
+            f"  cd {checkout} && python3 -c \"import sys; sys.path.append('.'); "
+            "from rvc.train.extract.extract import FeatureInput; "
+            f"FeatureInput(f0_method='{self.f0_method}', device='cuda:0')\"\n"
+            f"Проверьте также веса предиктора: ls -la {checkout}/rvc/models/predictors/\n"
+            "Обходной путь — другой метод: --vc-option f0_method=fcpe (или crepe)."
+        )
+
     def _require_slices(self, logs_dir: Path, name: str) -> int:
         """Убедиться, что preprocess действительно нарезал аудио.
 
@@ -266,8 +285,9 @@ class RVCConverter(VoiceConverter):
                 f"  общих имён: {len(common)}, строк в {FILELIST}: {len(entries)}\n"
                 f"Причина: {reason}.\n"
                 "Applio собирает filelist.txt как пересечение имён этих четырёх папок, "
-                "поэтому пустая любая из них обнуляет обучение. Ищите ошибку в строках "
-                "[applio extract] выше (f0 считается на rmvpe и требует скачанной модели)."
+                "поэтому пустая любая из них обнуляет обучение.\n"
+                + (self._pitch_hint() if {"f0", "f0_voiced"} & set(empty) else
+                   "Ищите ошибку в строках [applio extract] выше.")
             )
 
         minimum = MIN_BATCHES * self.batch_size

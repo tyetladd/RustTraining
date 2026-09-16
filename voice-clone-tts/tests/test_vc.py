@@ -706,6 +706,7 @@ def test_resume_still_validates_the_prepared_data(applio, reference_wav, tmp_pat
     (applio / "logs" / "anna" / "filelist.txt").write_text("", encoding="utf-8")
     runner.commands.clear()
 
-    with pytest.raises(VoiceConversionError, match="пусто в f0"):
+    with pytest.raises(VoiceConversionError, match="f0_voiced") as excinfo:
         RVCConverter().train(dataset, tmp_path / "voice", epochs=10, resume=True)
+    assert "sliced_audios: 40" in str(excinfo.value)  # видно, что уцелело
     assert runner.commands == []  # ни одной команды: остановились на проверке
