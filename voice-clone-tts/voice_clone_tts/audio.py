@@ -136,6 +136,34 @@ def save_audio(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
     return path
 
 
+def probe_info(path: str | Path) -> dict:
+    """Container facts about a file without decoding it (best effort)."""
+    path = Path(path)
+    info: dict = {"path": str(path), "bytes": path.stat().st_size if path.exists() else 0}
+    try:
+        import soundfile as sf
+
+        probed = sf.info(str(path))
+        info.update(
+            sample_rate=int(probed.samplerate),
+            channels=int(probed.channels),
+            format=probed.format,
+            subtype=probed.subtype,
+            frames=int(probed.frames),
+            duration=float(probed.duration),
+        )
+    except Exception:  # noqa: BLE001 - ffmpeg-only formats end up here
+        pass
+    if "duration" not in info:
+        duration = probe_duration(path)
+        if duration:
+            info["duration"] = duration
+    if info.get("duration") and info.get("bytes"):
+        # Rough kbps, enough to spot a 64 kbps voice memo.
+        info["kbps"] = round(info["bytes"] * 8 / info["duration"] / 1000)
+    return info
+
+
 def probe_duration(path: str | Path) -> float | None:
     """Duration in seconds without decoding the whole file (best effort)."""
     path = Path(path)

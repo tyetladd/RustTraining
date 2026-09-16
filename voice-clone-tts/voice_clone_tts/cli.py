@@ -1,6 +1,7 @@
 """Command line interface.
 
     vctts speak -v sample.mp3 -t "Привет!" -o out.wav
+    vctts check sample.mp3
     vctts profile build sample.mp3 -o profiles/anna
     vctts speak -p profiles/anna -f article.txt -o article.wav
     vctts stress "Дорогая, замок на горе"
@@ -28,6 +29,7 @@ from voice_clone_tts.backends import (
 from voice_clone_tts.config import ASRConfig, PipelineConfig, ReferenceConfig, SynthesisConfig, TextConfig
 from voice_clone_tts.errors import VoiceCloneError
 from voice_clone_tts.profile import SpeakerProfile, build_profile
+from voice_clone_tts.quality import assess
 from voice_clone_tts.pipeline import prepare_text, synthesize
 from voice_clone_tts.text.languages import get_language, list_languages, load_language_config
 from voice_clone_tts.text.stress import StressStyle
@@ -272,6 +274,15 @@ def cmd_stress(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    report = assess(args.audio, purpose=args.purpose)
+    if args.json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(report.describe())
+    return 0 if report.verdict != "fail" or not args.strict else 1
+
+
 def cmd_voice_train(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     out_dir = Path(args.out)
@@ -439,6 +450,19 @@ def build_parser() -> argparse.ArgumentParser:
     stress.add_argument("--show-chunks", action="store_true", help="also print the chunk split")
     _add_common(stress)
     stress.set_defaults(func=cmd_stress)
+
+    # check -------------------------------------------------------------------
+    check = subparsers.add_parser(
+        "check", help="grade a recording before spending GPU hours on it"
+    )
+    check.add_argument("audio", help="candidate recording")
+    check.add_argument("--purpose", choices=["vc", "xtts"], default="vc",
+                       help="vc: training a voice-conversion model; xtts: zero-shot cloning")
+    check.add_argument("--json", action="store_true")
+    check.add_argument("--strict", action="store_true",
+                       help="exit with 1 when the recording fails (for scripts)")
+    _add_common(check)
+    check.set_defaults(func=cmd_check)
 
     # voice (conversion models) ----------------------------------------------
     voice = subparsers.add_parser("voice", help="train and inspect voice-conversion models")
