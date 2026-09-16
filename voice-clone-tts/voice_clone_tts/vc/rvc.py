@@ -340,10 +340,15 @@ class RVCConverter(VoiceConverter):
                 "--cpu-cores", self.cpu_cores,
                 label="applio preprocess",
             )
-            slices = self._require_slices(logs_dir, name)
-            if stop_after == "preprocess":
-                return self._partial_model(name, out_dir, dataset, logs_dir, "preprocess",
-                                           {"slices": slices})
+
+        # Проверки идут и при --resume: там подготовка пропускается, и без них
+        # прогон уткнулся бы в те же пустые данные, что и в прошлый раз.
+        slices = self._require_slices(logs_dir, name)
+        if stop_after == "preprocess":
+            return self._partial_model(name, out_dir, dataset, logs_dir, "preprocess",
+                                       {"slices": slices})
+
+        if not resume:
             self._core(
                 "extract",
                 "--model-name", name,
@@ -353,10 +358,11 @@ class RVCConverter(VoiceConverter):
                 "--gpu", self._gpu_argument(),
                 label="applio extract",
             )
-            entries = self._require_features(logs_dir, name)
-            if stop_after == "extract":
-                return self._partial_model(name, out_dir, dataset, logs_dir, "extract",
-                                           {"filelist_entries": entries})
+
+        entries = self._require_features(logs_dir, name)
+        if stop_after == "extract":
+            return self._partial_model(name, out_dir, dataset, logs_dir, "extract",
+                                       {"filelist_entries": entries})
 
         log.info("training RVC model '%s' for %d epochs — this is the long part", name, epochs)
         self._core(

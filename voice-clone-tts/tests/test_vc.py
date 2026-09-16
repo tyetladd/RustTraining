@@ -693,3 +693,19 @@ def test_rvc_names_the_empty_stage_directory(applio, reference_wav, tmp_path, mo
     assert "sliced_audios: 40" in message and "extracted: 40" in message
     assert "rmvpe" in message
     assert [c[2] for c in runner.commands] == ["preprocess", "extract"]  # train не запускался
+
+
+def test_resume_still_validates_the_prepared_data(applio, reference_wav, tmp_path, monkeypatch):
+    """--resume skips preparation, so the checks matter there most of all."""
+    runner = FakeApplio(applio, skip_dirs=("f0", "f0_voiced"))
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    dataset = _dataset(reference_wav, tmp_path)
+
+    # Оставляем состояние прошлого прогона: нарезка есть, f0 нет.
+    RVCConverter().train(dataset, tmp_path / "voice", stop_after="preprocess")
+    (applio / "logs" / "anna" / "filelist.txt").write_text("", encoding="utf-8")
+    runner.commands.clear()
+
+    with pytest.raises(VoiceConversionError, match="пусто в f0"):
+        RVCConverter().train(dataset, tmp_path / "voice", epochs=10, resume=True)
+    assert runner.commands == []  # ни одной команды: остановились на проверке
