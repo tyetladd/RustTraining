@@ -46,6 +46,14 @@ SUPPORTED_SAMPLE_RATES = (32_000, 40_000, 48_000)
 DEFAULT_SAMPLE_RATE = 40_000
 DEFAULT_EPOCHS = 300
 
+# core.py catches the exit code of the script it runs and prints this instead,
+# so a failed step still exits 0. Without these patterns a broken training run
+# looks like a successful one that produced no weights.
+APPLIO_FAILURE_PATTERNS = (
+    "failed for model",
+    "Traceback (most recent call last)",
+)
+
 
 def find_applio(explicit: str | Path | None = None) -> Path | None:
     """Locate an Applio checkout: explicit path, env var, then ./Applio."""
@@ -163,9 +171,25 @@ class RVCConverter(VoiceConverter):
             cwd=checkout,
             label=label,
             timeout=self.timeout,
+            failure_patterns=APPLIO_FAILURE_PATTERNS,
         )
 
     # -- training ---------------------------------------------------------
+    @staticmethod
+    def _require_checkpoints(logs_dir: Path, name: str) -> None:
+        """Fail loudly right after training, before the index step hides it."""
+        if any(logs_dir.glob("*.pth")):
+            return
+        listing = sorted(path.name for path in logs_dir.glob("*"))[:20] if logs_dir.exists() else []
+        raise VoiceConversionError(
+            f"training '{name}' produced no .pth weights in {logs_dir}.\n"
+            f"Applio's own step must have failed — its output is in the log above.\n"
+            f"What is in that directory now: {listing or 'ничего'}\n"
+            "Reproduce it directly to see the error in full:\n"
+            f"  cd {logs_dir.parent.parent} && python3 core.py train --model-name {name} "
+            "--total-epoch 5 --batch-size 8 --save-every-epoch 1 --sample-rate 40000 --gpu 0"
+        )
+
     @staticmethod
     def _collect_artifacts(logs_dir: Path) -> tuple[Path, Path | None]:
         weights = [p for p in logs_dir.glob("*.pth") if not p.name.startswith(("G_", "D_"))]
@@ -223,6 +247,7 @@ class RVCConverter(VoiceConverter):
             "--gpu", self._gpu_argument(),
             label="applio train",
         )
+        self._require_checkpoints(logs_dir, name)
         self._core("index", "--model-name", name, label="applio index")
 
         checkpoint, index = self._collect_artifacts(logs_dir)

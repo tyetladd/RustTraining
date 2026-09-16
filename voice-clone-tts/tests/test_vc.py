@@ -152,7 +152,7 @@ class FakeSvc:
     def __init__(self):
         self.commands: list[list[str]] = []
 
-    def __call__(self, args, *, cwd=None, env=None, timeout=None, label="", check=True):
+    def __call__(self, args, *, cwd=None, env=None, timeout=None, label="", check=True, **kwargs):
         args = [str(arg) for arg in args]
         self.commands.append(args)
         step = args[1]
@@ -209,6 +209,7 @@ def test_sovits_training_fails_without_a_checkpoint(fake_svc, reference_wav, tmp
         args = [str(a) for a in args]
         return original(args, **kwargs) if args[1] != "train" else CommandResult(args, 0)
 
+
     monkeypatch.setattr("voice_clone_tts.vc.sovits.run_command", no_checkpoint)
     with pytest.raises(VoiceConversionError, match="no G_.*checkpoint"):
         SoVitsConverter().train(dataset, tmp_path / "voice")
@@ -258,7 +259,7 @@ class FakeApplio:
         self.checkout = checkout
         self.commands: list[list[str]] = []
 
-    def __call__(self, args, *, cwd=None, env=None, timeout=None, label="", check=True):
+    def __call__(self, args, *, cwd=None, env=None, timeout=None, label="", check=True, **kwargs):
         args = [str(arg) for arg in args]
         self.commands.append(args)
         step = args[2]
@@ -472,3 +473,75 @@ def test_rvc_uses_every_cpu_core_by_default(monkeypatch):
     monkeypatch.setattr("voice_clone_tts.vc.rvc.os.cpu_count", lambda: 4)
     assert RVCConverter().cpu_cores == 4
     assert RVCConverter(cpu_cores=2).cpu_cores == 2
+
+
+# --------------------------------------------------------------------------
+# Applio reports failure in its output while still exiting 0
+# --------------------------------------------------------------------------
+
+def test_run_command_catches_a_failure_reported_with_exit_code_zero():
+    """core.py swallows its child's exit code and just prints the failure."""
+    script = (
+        "print('Starting training...')\n"
+        "print('Training failed for model andrei. Please check the console logs.')\n"
+    )
+    with pytest.raises(ToolchainError, match="exiting 0"):
+        run_command(
+            ["python3", "-c", script],
+            label="applio train",
+            failure_patterns=("failed for model",),
+        )
+
+
+def test_run_command_ignores_failure_patterns_in_ordinary_output():
+    result = run_command(
+        ["python3", "-c", "print('epoch 1: loss 3.2')"],
+        label="applio train",
+        failure_patterns=("failed for model",),
+    )
+    assert result.ok
+
+
+def test_run_command_keeps_only_the_last_state_of_a_progress_line():
+    script = "import sys; sys.stdout.write('10%\\r50%\\r100% done\\n')"
+    result = run_command(["python3", "-c", script], label="progress")
+    assert result.tail == ["100% done"]
+
+
+def test_rvc_stops_when_training_produced_no_weights(applio, reference_wav, tmp_path, monkeypatch):
+    """The index step must not run and hide a training failure."""
+
+    class SilentlyFailing(FakeApplio):
+        def __call__(self, args, **kwargs):
+            args = [str(a) for a in args]
+            if args[2] == "train":
+                self.commands.append(args)
+                return CommandResult(args=args, returncode=0)  # no weights written
+            return super().__call__(args, **kwargs)
+
+    runner = SilentlyFailing(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    dataset = build_training_dataset(
+        reference_wav, out_dir=tmp_path / "ds", speaker="anna", max_clip_sec=2.0, min_clip_sec=0.4
+    )
+
+    with pytest.raises(VoiceConversionError) as excinfo:
+        RVCConverter().train(dataset, tmp_path / "voice", epochs=10)
+
+    message = str(excinfo.value)
+    assert "no .pth weights" in message
+    assert "core.py train --model-name anna" in message  # как воспроизвести
+    assert [c[2] for c in runner.commands] == ["preprocess", "extract", "train"]  # index не запускался
+
+
+def test_rvc_passes_failure_patterns_to_the_runner(applio, reference_wav, tmp_path, monkeypatch):
+    seen = []
+
+    def spy(args, **kwargs):
+        seen.append(kwargs.get("failure_patterns"))
+        return FakeApplio(applio)(args, **kwargs)
+
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", spy)
+    converter = RVCConverter()
+    converter._core("preprocess", "--model-name", "anna", label="applio preprocess")
+    assert seen and "failed for model" in seen[0]

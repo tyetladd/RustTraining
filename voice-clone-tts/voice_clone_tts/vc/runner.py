@@ -25,7 +25,7 @@ from voice_clone_tts.errors import VoiceCloneError
 
 log = logging.getLogger(__name__)
 
-TAIL_LINES = 40
+TAIL_LINES = 80
 POLL_SECONDS = 0.5
 GRACE_SECONDS = 10.0
 
@@ -103,9 +103,28 @@ def _terminate_tree(process: subprocess.Popen) -> None:
 
 
 def _stream_reader(stream, sink: "queue.Queue[str | None]") -> None:
+    """Split the output on newlines only, keeping ``\r`` inside a line.
+
+    Text mode would translate every ``\r`` into a line break, turning one
+    progress bar into thousands of log lines. Reading bytes and splitting on
+    ``\n`` keeps a redrawn bar as a single line, of which the caller then
+    logs only the final state.
+    """
+    buffer = b""
     try:
-        for line in stream:
-            sink.put(line)
+        while True:
+            read1 = getattr(stream, "read1", None)
+            chunk = read1(65536) if read1 else os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                sink.put(line.decode("utf-8", "replace"))
+        if buffer:
+            sink.put(buffer.decode("utf-8", "replace"))
+    except (OSError, ValueError):  # поток закрыли, пока мы читали
+        pass
     finally:
         sink.put(None)
 
@@ -118,12 +137,23 @@ def run_command(
     timeout: float | None = None,
     label: str = "",
     check: bool = True,
+    failure_patterns: Sequence[str] = (),
+    stream_level: int = logging.INFO,
 ) -> CommandResult:
-    """Run `args`, streaming its output to the log at DEBUG level.
+    """Run `args`, streaming its output to the log.
 
     `timeout` is a wall-clock budget for the whole command, enforced while the
     output is being read — cloud sessions end on a hard limit, so a training
     run has to be stopped in time for its checkpoints to be saved.
+
+    `failure_patterns` catches tools that report failure in their output while
+    still exiting 0: Applio's ``core.py`` swallows the exit code of the script
+    it runs and merely prints "Training failed for model …", which would
+    otherwise look like success.
+
+    Output is logged at `stream_level` (INFO by default) because for a training
+    run this stream *is* the progress report — and, when something breaks, the
+    only place the real error appears.
     """
     args = [str(arg) for arg in args]
     label = label or Path(args[0]).name
@@ -131,6 +161,7 @@ def run_command(
 
     merged_env = {**os.environ, **(env or {})}
     tail: deque[str] = deque(maxlen=TAIL_LINES)
+    reported_failure: str | None = None
     try:
         process = subprocess.Popen(
             args,
@@ -138,8 +169,6 @@ def run_command(
             env=merged_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
             start_new_session=True,  # own process group, so the tree can be killed
         )
     except FileNotFoundError as exc:
@@ -162,10 +191,17 @@ def run_command(
                 if line is None:
                     finished = True
                     line = ""
-            stripped = line.rstrip()
+            # Progress bars rewrite one line with \r; keep only its final state.
+            stripped = line.rpartition("\r")[2].rstrip()
             if stripped:
                 tail.append(stripped)
-                log.debug("[%s] %s", label, stripped)
+                log.log(stream_level, "[%s] %s", label, stripped)
+                if reported_failure is None:
+                    lowered = stripped.lower()
+                    for pattern in failure_patterns:
+                        if pattern.lower() in lowered:
+                            reported_failure = stripped
+                            break
             if deadline is not None and time.monotonic() > deadline and not finished:
                 log.warning("%s: time budget of %.0fs is up, stopping it", label, timeout)
                 _terminate_tree(process)
@@ -184,6 +220,12 @@ def run_command(
             _terminate_tree(process)
 
     result = CommandResult(args=args, returncode=process.returncode, tail=list(tail))
+    if check and result.ok and reported_failure is not None:
+        raise ToolchainError(
+            f"{label} reported a failure while still exiting 0:\n"
+            f"  {reported_failure}\n"
+            f"Last output:\n{result.output()}"
+        )
     if check and not result.ok:
         raise ToolchainError(
             f"{label} exited with code {result.returncode}.\n"
