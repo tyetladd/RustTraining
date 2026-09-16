@@ -52,7 +52,17 @@ DEFAULT_EPOCHS = 300
 APPLIO_FAILURE_PATTERNS = (
     "failed for model",
     "Traceback (most recent call last)",
+    # Оба шага печатают это и выходят с нулевым кодом.
+    "no audio files found in the dataset path",
+    "not enough data present in the training set",
 )
+
+# Applio раскладывает промежуточные данные по этим папкам внутри logs/<model>.
+SLICED_DIR = "sliced_audios"
+FEATURES_DIR = "extracted"
+FILELIST = "filelist.txt"
+MIN_BATCHES = 3
+"""train.py останавливается, если батчей меньше трёх — отсюда минимум фрагментов."""
 
 
 def find_applio(explicit: str | Path | None = None) -> Path | None:
@@ -175,6 +185,58 @@ class RVCConverter(VoiceConverter):
         )
 
     # -- training ---------------------------------------------------------
+    def _require_slices(self, logs_dir: Path, name: str) -> int:
+        """Убедиться, что preprocess действительно нарезал аудио.
+
+        Он сообщает об успехе, даже если каждый файл упал при чтении: ошибки
+        печатаются построчно («Error processing audio: …») и проглатываются.
+        Без этой проверки пустота всплывёт только на обучении.
+        """
+        sliced = sorted((logs_dir / SLICED_DIR).glob("*.wav"))
+        if not sliced:
+            raise VoiceConversionError(
+                f"preprocess не нарезал ни одного фрагмента в {logs_dir / SLICED_DIR}.\n"
+                "Ищите в логе выше строки «Error processing audio:» — там причина "
+                "по каждому файлу.\n"
+                "Проверить вручную:\n"
+                f"  cd {logs_dir.parent.parent} && python3 core.py preprocess "
+                f"--model-name {name} --dataset-path <папка с клипами> "
+                f"--sample-rate {self.sample_rate} --cpu-cores {self.cpu_cores}"
+            )
+        log.info("preprocess: %d фрагментов в %s", len(sliced), logs_dir / SLICED_DIR)
+        return len(sliced)
+
+    def _require_features(self, logs_dir: Path, name: str) -> int:
+        """Убедиться, что extract дал признаки и что их хватит на обучение."""
+        features = sorted((logs_dir / FEATURES_DIR).glob("*"))
+        filelist = logs_dir / FILELIST
+        entries = (
+            [line for line in filelist.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if filelist.exists()
+            else []
+        )
+        if not features or not entries:
+            raise VoiceConversionError(
+                f"extract не подготовил данные для обучения в {logs_dir}:\n"
+                f"  признаков в {FEATURES_DIR}/: {len(features)}\n"
+                f"  строк в {FILELIST}: {len(entries)}\n"
+                "Причина — в строках [applio extract] выше."
+            )
+
+        minimum = MIN_BATCHES * self.batch_size
+        if len(entries) < minimum:
+            raise VoiceConversionError(
+                f"для обучения слишком мало данных: {len(entries)} фрагментов, "
+                f"а при batch_size={self.batch_size} нужно минимум {minimum} "
+                f"({MIN_BATCHES} батча).\n"
+                "Иначе Applio молча остановится с «Not enough data present in the "
+                "training set».\n"
+                f"Варианты: уменьшить batch_size (--vc-option batch_size="
+                f"{max(1, len(entries) // MIN_BATCHES)}) или записать больше речи."
+            )
+        log.info("extract: %d фрагментов, %d строк в %s", len(features), len(entries), FILELIST)
+        return len(entries)
+
     @staticmethod
     def _require_checkpoints(logs_dir: Path, name: str) -> None:
         """Fail loudly right after training, before the index step hides it."""
@@ -226,6 +288,7 @@ class RVCConverter(VoiceConverter):
                 "--cpu-cores", self.cpu_cores,
                 label="applio preprocess",
             )
+            self._require_slices(logs_dir, name)
             self._core(
                 "extract",
                 "--model-name", name,
@@ -235,6 +298,7 @@ class RVCConverter(VoiceConverter):
                 "--gpu", self._gpu_argument(),
                 label="applio extract",
             )
+            self._require_features(logs_dir, name)
 
         log.info("training RVC model '%s' for %d epochs — this is the long part", name, epochs)
         self._core(
