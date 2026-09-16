@@ -89,6 +89,12 @@ class RVCConverter(VoiceConverter):
         self.protect = float(options.get("protect", 0.33))
         self.volume_envelope = float(options.get("volume_envelope", 1.0))
         self.python = options.get("python", sys.executable)
+        self.logs_dir = options.get("logs_dir")
+        """Persistent parent for Applio's per-model logs (Drive, /kaggle/working…).
+
+        Cloud sessions die before a long training does, so the checkpoints must
+        not live inside the ephemeral checkout.
+        """
         self.timeout = options.get("timeout")
 
     @classmethod
@@ -110,6 +116,43 @@ class RVCConverter(VoiceConverter):
             _, _, index = device.partition(":")
             return index or "0"
         return "-"  # Applio reads "-" as CPU
+
+    def _prepare_logs(self, name: str) -> Path:
+        """Return Applio's logs dir for `name`, linked to persistent storage if asked."""
+        target = self._checkout() / "logs" / name
+        if not self.logs_dir:
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+
+        persistent = (Path(self.logs_dir).expanduser() / name).resolve()
+        persistent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if target.is_symlink():
+            if target.resolve() == persistent:
+                return target
+            target.unlink()
+        elif target.exists():
+            existing = list(target.iterdir())
+            if existing and any(persistent.iterdir()):
+                raise VoiceConversionError(
+                    f"both {target} and {persistent} hold training data; "
+                    "remove one of them before linking"
+                )
+            for item in existing:
+                shutil.move(str(item), persistent / item.name)
+            target.rmdir()
+
+        try:
+            target.symlink_to(persistent, target_is_directory=True)
+            log.info("Applio logs for '%s' now live in %s", name, persistent)
+        except OSError as exc:  # pragma: no cover - Windows without privileges
+            log.warning(
+                "could not link %s -> %s (%s); checkpoints stay inside the checkout",
+                target, persistent, exc,
+            )
+            target.mkdir(parents=True, exist_ok=True)
+        return target
 
     def _core(self, *args: object, label: str) -> None:
         checkout = self._checkout()
@@ -146,6 +189,7 @@ class RVCConverter(VoiceConverter):
         out_dir.mkdir(parents=True, exist_ok=True)
         name = name or dataset.speaker
         epochs = int(epochs or DEFAULT_EPOCHS)
+        logs_dir = self._prepare_logs(name)
 
         if not resume:
             self._core(
@@ -179,7 +223,6 @@ class RVCConverter(VoiceConverter):
         )
         self._core("index", "--model-name", name, label="applio index")
 
-        logs_dir = checkout / "logs" / name
         checkpoint, index = self._collect_artifacts(logs_dir)
         local_checkpoint = out_dir / checkpoint.name
         shutil.copy2(checkpoint, local_checkpoint)

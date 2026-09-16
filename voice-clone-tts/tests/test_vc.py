@@ -345,3 +345,70 @@ def test_run_command_raises_with_the_tail_of_the_output():
 def test_run_command_reports_a_missing_binary():
     with pytest.raises(ToolchainError, match="command not found"):
         run_command(["definitely-not-a-real-binary-xyz"])
+
+
+# --------------------------------------------------------------------------
+# cloud training: checkpoints must survive an ephemeral checkout
+# --------------------------------------------------------------------------
+
+def test_rvc_links_logs_to_persistent_storage(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    persistent = tmp_path / "drive" / "logs"
+    dataset = build_training_dataset(
+        reference_wav, out_dir=tmp_path / "ds", speaker="anna", max_clip_sec=2.0, min_clip_sec=0.4
+    )
+
+    model = RVCConverter(logs_dir=str(persistent)).train(dataset, tmp_path / "voice", epochs=1)
+
+    link = applio / "logs" / "anna"
+    assert link.is_symlink()
+    assert link.resolve() == (persistent / "anna").resolve()
+    assert (persistent / "anna" / "anna.pth").exists()  # written through the link
+    assert model.checkpoint.exists()
+
+
+def test_rvc_moves_existing_logs_into_persistent_storage(applio, tmp_path):
+    stale = applio / "logs" / "anna"
+    stale.mkdir(parents=True)
+    (stale / "G_100.pth").write_bytes(b"old")
+    persistent = tmp_path / "drive" / "logs"
+
+    linked = RVCConverter(logs_dir=str(persistent))._prepare_logs("anna")
+    assert linked.is_symlink()
+    assert (persistent / "anna" / "G_100.pth").exists()
+
+
+def test_rvc_refuses_to_merge_two_populated_log_dirs(applio, tmp_path):
+    stale = applio / "logs" / "anna"
+    stale.mkdir(parents=True)
+    (stale / "G_100.pth").write_bytes(b"old")
+    persistent = tmp_path / "drive" / "logs" / "anna"
+    persistent.mkdir(parents=True)
+    (persistent / "G_200.pth").write_bytes(b"new")
+
+    with pytest.raises(VoiceConversionError, match="hold training data"):
+        RVCConverter(logs_dir=str(tmp_path / "drive" / "logs"))._prepare_logs("anna")
+
+
+def test_dataset_is_reused_when_resuming(reference_wav, tmp_path):
+    first = build_training_dataset(
+        reference_wav, out_dir=tmp_path / "ds", speaker="anna", max_clip_sec=2.0, min_clip_sec=0.4
+    )
+    stamps = {clip: clip.stat().st_mtime_ns for clip in first.clips}
+
+    again = build_training_dataset(
+        reference_wav, out_dir=tmp_path / "ds", speaker="anna", reuse_existing=True
+    )
+    assert [c.name for c in again.clips] == [c.name for c in first.clips]
+    assert {clip: clip.stat().st_mtime_ns for clip in again.clips} == stamps  # not rewritten
+    assert abs(again.total_duration - first.total_duration) < 0.1
+    assert again.median_f0 > 0
+
+
+def test_reuse_falls_through_to_a_normal_build(reference_wav, tmp_path):
+    dataset = build_training_dataset(
+        reference_wav, out_dir=tmp_path / "ds", speaker="anna",
+        max_clip_sec=2.0, min_clip_sec=0.4, reuse_existing=True,
+    )
+    assert dataset.clips  # nothing on disk yet, so it is built from the recording

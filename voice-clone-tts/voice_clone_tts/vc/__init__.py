@@ -14,7 +14,11 @@ from voice_clone_tts.vc.base import (
     list_converters,
     register_converter,
 )
-from voice_clone_tts.vc.dataset import TrainingDataset, build_training_dataset
+from voice_clone_tts.vc.dataset import (
+    TrainingDataset,
+    build_training_dataset,
+    load_existing_dataset,
+)
 from voice_clone_tts.vc.runner import ToolchainError
 
 # Import for the side effect of registering the converters.
@@ -35,5 +39,6 @@ __all__ = [
     "get_converter",
     "iter_converter_info",
     "list_converters",
+    "load_existing_dataset",
     "register_converter",
 ]

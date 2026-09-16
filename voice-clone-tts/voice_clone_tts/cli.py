@@ -287,6 +287,7 @@ def cmd_voice_train(args: argparse.Namespace) -> int:
         max_clip_sec=args.max_clip_seconds,
         min_clip_sec=args.min_clip_seconds,
         overwrite=args.overwrite,
+        reuse_existing=args.resume,
     )
     print(dataset.describe())
     if args.dataset_only:

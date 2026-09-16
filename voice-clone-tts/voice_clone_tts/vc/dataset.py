@@ -77,6 +77,39 @@ class TrainingDataset:
         return "\n".join(lines)
 
 
+def load_existing_dataset(
+    out_dir: str | Path,
+    speaker: str,
+    *,
+    sample_rate: int = 44_100,
+    source: str | Path | None = None,
+) -> TrainingDataset:
+    """Describe clips that were prepared by an earlier run."""
+    out_dir = Path(out_dir)
+    speaker_dir = out_dir / RAW_DIR / speaker
+    clips = sorted(speaker_dir.glob("*.wav"))
+    if not clips:
+        raise AudioError(f"no prepared clips in {speaker_dir}")
+
+    total = 0.0
+    for clip in clips:
+        duration = audio_utils.probe_duration(clip)
+        total += duration if duration else 0.0
+    head = [audio_utils.load_audio(clip, sample_rate, mono=True)[0] for clip in clips[:20]]
+    median_f0 = audio_utils.estimate_f0(np.concatenate(head), sample_rate) if head else 0.0
+
+    log.info("reusing %d prepared clips (%.1f min) from %s", len(clips), total / 60, speaker_dir)
+    return TrainingDataset(
+        directory=out_dir,
+        speaker=speaker,
+        clips=clips,
+        sample_rate=sample_rate,
+        total_duration=total,
+        source=str(source) if source else None,
+        median_f0=median_f0,
+    )
+
+
 def _split_segment(start: float, end: float, max_clip_sec: float) -> list[tuple[float, float]]:
     """Cut one speech region into pieces of at most `max_clip_sec`."""
     duration = end - start
@@ -99,11 +132,15 @@ def build_training_dataset(
     top_db: float = 35.0,
     target_dbfs: float = -20.0,
     overwrite: bool = False,
+    reuse_existing: bool = False,
 ) -> TrainingDataset:
     """Cut a recording into training clips.
 
     Pass either `source` (the original recording) or `profile`; with a profile
     the original file is preferred and its reference clips are the fallback.
+
+    With `reuse_existing` a dataset that is already on disk is picked up as is,
+    which is what resuming an interrupted training run needs.
     """
     out_dir = Path(out_dir)
     if source is None and profile is None:
@@ -127,6 +164,8 @@ def build_training_dataset(
 
     speaker_dir = out_dir / RAW_DIR / speaker
     if speaker_dir.exists() and any(speaker_dir.iterdir()):
+        if reuse_existing and not overwrite:
+            return load_existing_dataset(out_dir, speaker, sample_rate=sample_rate, source=source)
         if not overwrite:
             raise AudioError(f"{speaker_dir} already holds clips; pass --overwrite to rebuild")
         shutil.rmtree(speaker_dir)
