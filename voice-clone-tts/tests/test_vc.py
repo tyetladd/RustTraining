@@ -271,7 +271,9 @@ class FakeApplio:
     """
 
     def __init__(self, checkout: Path, *, slices: int = 40, entries: int = 40,
-                 skip_dirs: tuple[str, ...] = (), skip_prerequisites: bool = False):
+                 skip_dirs: tuple[str, ...] = (), skip_prerequisites: bool = False,
+                 skip_export: bool = False):
+        self.skip_export = skip_export
         self.skip_prerequisites = skip_prerequisites
         self.checkout = checkout
         self.commands: list[list[str]] = []
@@ -306,7 +308,10 @@ class FakeApplio:
             )
         elif step == "train":
             logs.mkdir(parents=True, exist_ok=True)
-            (logs / f"{name}.pth").write_bytes(b"w")
+            (logs / "G_10800.pth").write_bytes(b"checkpoint")
+            (logs / "D_10800.pth").write_bytes(b"checkpoint")
+            if not self.skip_export:
+                (logs / f"{name}_300e_10800s.pth").write_bytes(b"model")
         elif step == "index":
             (logs / f"{name}.index").write_bytes(b"i")
         elif step == "prerequisites":
@@ -414,7 +419,7 @@ def test_rvc_links_logs_to_persistent_storage(applio, reference_wav, tmp_path, m
     link = applio / "logs" / "anna"
     assert link.is_symlink()
     assert link.resolve() == (persistent / "anna").resolve()
-    assert (persistent / "anna" / "anna.pth").exists()  # written through the link
+    assert (persistent / "anna" / "anna_300e_10800s.pth").exists()  # written through the link
     assert model.checkpoint.exists()
 
 
@@ -831,3 +836,57 @@ def test_both_stages_get_the_same_devices(applio, reference_wav, tmp_path, monke
     for command in runner.commands:
         if command[2] in {"extract", "train"}:
             assert command[command.index("--gpu") + 1] == "0-1"
+
+
+# --------------------------------------------------------------------------
+# training checkpoints are not inference models
+# --------------------------------------------------------------------------
+
+def test_rvc_picks_the_exported_model_not_the_checkpoint(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    model = RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
+    assert model.checkpoint.name == "anna_300e_10800s.pth"
+    assert not model.checkpoint.name.startswith("G_")
+
+
+def test_rvc_refuses_a_training_checkpoint(applio, reference_wav, tmp_path, monkeypatch):
+    """Inference on G_*.pth dies with KeyError: 'config' — catch it here instead."""
+    runner = FakeApplio(applio, skip_export=True)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    with pytest.raises(VoiceConversionError) as excinfo:
+        RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
+
+    message = str(excinfo.value)
+    assert "не сохранило итоговую модель" in message
+    assert "G_10800.pth" in message and "KeyError" in message
+
+
+def test_assets_config_is_written_without_a_template(applio, reference_wav, tmp_path, monkeypatch):
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", FakeApplio(applio))
+    RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
+
+    config = json.loads((applio / "assets/config.json").read_text(encoding="utf-8"))
+    assert "model_author" in config
+
+
+def test_assets_config_prefers_applios_template(applio, reference_wav, tmp_path, monkeypatch):
+    template = applio / "assets" / "config_template.json"
+    template.parent.mkdir(parents=True)
+    template.write_text('{"model_author": null, "theme": "dark"}', encoding="utf-8")
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", FakeApplio(applio))
+
+    RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
+    assert json.loads((applio / "assets/config.json").read_text(encoding="utf-8"))["theme"] == "dark"
+
+
+def test_existing_assets_config_is_left_alone(applio, reference_wav, tmp_path, monkeypatch):
+    path = applio / "assets" / "config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"model_author": "someone"}', encoding="utf-8")
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", FakeApplio(applio))
+
+    RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=300)
+    assert json.loads(path.read_text(encoding="utf-8"))["model_author"] == "someone"

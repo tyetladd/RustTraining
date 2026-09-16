@@ -19,8 +19,10 @@ Point the driver at your checkout with ``VCTTS_APPLIO_DIR=/path/to/Applio`` or
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -70,6 +72,11 @@ STAGE_DIRS = (SLICED_DIR, FEATURES_DIR, "f0", "f0_voiced")
 PREDICTORS_DIR = "rvc/models/predictors"
 EMBEDDERS_DIR = "rvc/models/embedders/contentvec"
 PRETRAINEDS_DIR = "rvc/models/pretraineds"
+
+# Applio сохраняет экспортированные модели как "<имя>_<эпоха>e_<шаг>s.pth".
+# G_*/D_* — тренировочные чекпоинты с состоянием оптимизатора: инференс на них
+# падает с KeyError: 'config'.
+EXPORTED_MODEL = re.compile(r"_\d+e_\d+s\.pth$")
 """generate_filelist() берёт ПЕРЕСЕЧЕНИЕ имён из этих четырёх папок.
 
 Пустая любая из них — и filelist.txt оказывается пустым, а обучение
@@ -412,17 +419,43 @@ class RVCConverter(VoiceConverter):
         printing "An error occurred extracting the model" for every checkpoint."""
         config = checkout / "assets" / "config.json"
         template = checkout / "assets" / "config_template.json"
-        if not config.exists() and template.exists():
+        if config.exists():
+            return
+        config.parent.mkdir(parents=True, exist_ok=True)
+        if template.exists():
             shutil.copy2(template, config)
+        else:
+            # Шаблона нет — extract_model() читает отсюда только автора модели.
+            config.write_text(json.dumps({"model_author": None}, indent=4), encoding="utf-8")
+        log.info("создан %s — без него Applio не сохраняет итоговую модель", config)
 
     @staticmethod
-    def _collect_artifacts(logs_dir: Path) -> tuple[Path, Path | None]:
-        weights = [p for p in logs_dir.glob("*.pth") if not p.name.startswith(("G_", "D_"))]
-        if not weights:
-            weights = sorted(logs_dir.glob("G_*.pth"))
-        if not weights:
-            raise VoiceConversionError(f"training produced no .pth weights in {logs_dir}")
-        checkpoint = max(weights, key=lambda path: path.stat().st_mtime)
+    def _collect_artifacts(logs_dir: Path, name: str) -> tuple[Path, Path | None]:
+        """Выбрать экспортированную модель и индекс.
+
+        Тренировочные чекпоинты G_*/D_* для синтеза не годятся: в них состояние
+        оптимизатора, а не то, что ждёт RVC, — инференс падает с
+        ``KeyError: 'config'``.
+        """
+        exported = [path for path in logs_dir.glob("*.pth") if EXPORTED_MODEL.search(path.name)]
+        if not exported:
+            # Модель могли назвать иначе: берём всё, что не чекпоинт.
+            exported = [
+                path for path in logs_dir.glob("*.pth")
+                if not path.name.startswith(("G_", "D_"))
+            ]
+        if not exported:
+            checkpoints = sorted(path.name for path in logs_dir.glob("[GD]_*.pth"))
+            raise VoiceConversionError(
+                f"обучение '{name}' не сохранило итоговую модель в {logs_dir}.\n"
+                f"Есть только тренировочные чекпоинты: {checkpoints or 'ни одного'} — "
+                "для синтеза они не годятся (инференс падает с KeyError: 'config').\n"
+                "Экспорт делает extract_model() и он молча падает без "
+                "assets/config.json; драйвер теперь создаёт этот файл сам, так что "
+                "достаточно доучить модель до следующего сохранения: тот же запуск "
+                "с --resume и большим --epochs."
+            )
+        checkpoint = max(exported, key=lambda path: path.stat().st_mtime)
         indexes = sorted(logs_dir.glob("*.index"), key=lambda path: path.stat().st_mtime)
         return checkpoint, (indexes[-1] if indexes else None)
 
@@ -497,7 +530,7 @@ class RVCConverter(VoiceConverter):
         self._require_checkpoints(logs_dir, name)
         self._core("index", "--model-name", name, label="applio index")
 
-        checkpoint, index = self._collect_artifacts(logs_dir)
+        checkpoint, index = self._collect_artifacts(logs_dir, name)
         local_checkpoint = out_dir / checkpoint.name
         shutil.copy2(checkpoint, local_checkpoint)
         local_index = None
