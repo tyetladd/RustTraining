@@ -24,6 +24,8 @@ asr = ["faster-whisper>=1.0"]
 xtts = ["coqui-tts>=0.25", "torch>=2.1", "torchaudio>=2.1"]
 # Non-cloning Silero TTS backend (great Russian prosody, consumes "+" stress marks natively)
 silero = ["torch>=1.12"]
+# Voice conversion via so-vits-svc-fork (the RVC/Applio driver needs a checkout, not a package)
+sovits = ["so-vits-svc-fork>=4.1"]
 dev = ["pytest>=7.4"]
 all = [
     "silero-stress>=1.5",

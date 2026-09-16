@@ -159,3 +159,122 @@ def test_explicit_stress_style_overrides_the_backend(reference_wav, monkeypatch,
     synthesize(voice=reference_wav, text="Замок.", config=config, backend=backend)
     assert captured["style"] is StressStyle.NONE
     assert "+" not in backend.requests[0].text
+
+
+# --------------------------------------------------------------------------
+# voice conversion stage
+# --------------------------------------------------------------------------
+
+def _register_fake_converter(name="fake-vc"):
+    """A converter that records its calls and shifts amplitude, not pitch."""
+    from voice_clone_tts.vc import VoiceConverter, register_converter
+
+    class FakeConverter(VoiceConverter):
+        calls: list = []
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            FakeConverter.calls = []
+
+        @classmethod
+        def is_available(cls):
+            return True
+
+        def train(self, dataset, out_dir, **kwargs):  # pragma: no cover - unused here
+            raise NotImplementedError
+
+        def convert(self, audio, sample_rate, model, *, transpose=0):
+            FakeConverter.calls.append((audio.size, sample_rate, model.name, transpose))
+            return audio * 0.5
+
+    FakeConverter.name = name
+    register_converter(FakeConverter)
+    return FakeConverter
+
+
+def _fake_voice_model(tmp_path, converter_name, median_f0=0.0):
+    from voice_clone_tts.vc import VoiceModel
+
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"weights")
+    model = VoiceModel(
+        name="anna", directory=tmp_path / "voice", converter=converter_name,
+        checkpoint=checkpoint, median_f0=median_f0,
+    )
+    model.save()
+    return model
+
+
+def test_voice_conversion_runs_on_every_chunk(reference_wav, tmp_path):
+    fake = _register_fake_converter("fake-vc-chunks")
+    _fake_voice_model(tmp_path, "fake-vc-chunks")
+
+    config = ru_config()
+    config.synthesis.voice_model = str(tmp_path / "voice")
+    backend = RecordingBackend()
+    result = synthesize(
+        voice=reference_wav, text="Первое предложение. Второе предложение.",
+        config=config, backend=backend,
+    )
+    assert len(fake.calls) == len(result.chunks)
+    assert result.voice_model == "anna"
+    assert "conversion" in result.timings
+    assert "anna" in result.describe()
+
+
+def test_auto_transpose_matches_the_target_pitch(reference_wav, tmp_path, monkeypatch):
+    fake = _register_fake_converter("fake-vc-auto")
+    _fake_voice_model(tmp_path, "fake-vc-auto", median_f0=220.0)
+
+    class TonalBackend(RecordingBackend):
+        name = "tonal"
+
+        def synthesize(self, request):
+            self.requests.append(request)
+            t = np.arange(self.sample_rate, dtype=np.float32) / self.sample_rate
+            return (np.sin(2 * np.pi * 110.0 * t) * 0.3).astype(np.float32)
+
+    config = ru_config()
+    config.synthesis.voice_model = str(tmp_path / "voice")
+    config.synthesis.transpose = "auto"
+    synthesize(voice=reference_wav, text="Тест.", config=config, backend=TonalBackend())
+
+    # 110 Hz -> 220 Hz is exactly one octave.
+    assert fake.calls[0][3] == 12
+
+
+def test_transpose_is_zero_without_a_reference_pitch(reference_wav, tmp_path):
+    fake = _register_fake_converter("fake-vc-nopitch")
+    _fake_voice_model(tmp_path, "fake-vc-nopitch", median_f0=0.0)
+
+    config = ru_config()
+    config.synthesis.voice_model = str(tmp_path / "voice")
+    config.synthesis.transpose = "auto"
+    synthesize(voice=reference_wav, text="Тест.", config=config, backend=RecordingBackend())
+    assert fake.calls[0][3] == 0
+
+
+def test_unavailable_converter_is_reported(reference_wav, tmp_path):
+    from voice_clone_tts.vc import VoiceConverter, register_converter
+
+    class Unavailable(VoiceConverter):
+        name = "fake-vc-missing"
+        install_hint = "pip install something"
+
+        @classmethod
+        def is_available(cls):
+            return False
+
+        def train(self, dataset, out_dir, **kwargs):  # pragma: no cover
+            raise NotImplementedError
+
+        def convert(self, audio, sample_rate, model, *, transpose=0):  # pragma: no cover
+            raise NotImplementedError
+
+    register_converter(Unavailable)
+    _fake_voice_model(tmp_path, "fake-vc-missing")
+
+    config = ru_config()
+    config.synthesis.voice_model = str(tmp_path / "voice")
+    with pytest.raises(BackendError, match="pip install something"):
+        synthesize(voice=reference_wav, text="Тест.", config=config, backend=RecordingBackend())

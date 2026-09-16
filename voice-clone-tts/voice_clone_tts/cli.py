@@ -4,6 +4,8 @@
     vctts profile build sample.mp3 -o profiles/anna
     vctts speak -p profiles/anna -f article.txt -o article.wav
     vctts stress "Дорогая, замок на горе"
+    vctts voice train -p profiles/anna -o voices/anna --vc rvc --epochs 300
+    vctts speak -b silero --voice-model voices/anna -t "Привет!" -o out.wav
     vctts backends
 """
 
@@ -29,6 +31,13 @@ from voice_clone_tts.profile import SpeakerProfile, build_profile
 from voice_clone_tts.pipeline import prepare_text, synthesize
 from voice_clone_tts.text.languages import get_language, list_languages, load_language_config
 from voice_clone_tts.text.stress import StressStyle
+from voice_clone_tts.vc import (
+    DEFAULT_CONVERTER,
+    VoiceModel,
+    build_training_dataset,
+    get_converter,
+    iter_converter_info,
+)
 
 log = logging.getLogger("vctts")
 
@@ -90,17 +99,43 @@ def _add_synthesis_options(parser: argparse.ArgumentParser) -> None:
                        help="acknowledge the non-commercial Coqui Public Model License for XTTS")
 
 
-def _parse_backend_options(pairs: list[str]) -> dict:
+def _add_conversion_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("voice conversion (cloning)")
+    group.add_argument("--voice-model", metavar="DIR",
+                       help="trained voice-conversion model; recolours the synthesized audio")
+    group.add_argument("--vc", choices=["rvc", "sovits"],
+                       help="converter to use (default: the one recorded in the model)")
+    group.add_argument("--transpose", default="0", metavar="N",
+                       help="pitch shift in semitones, or 'auto' to match the target speaker")
+    group.add_argument("--vc-device", default="auto", help="device for conversion (default: auto)")
+    group.add_argument("--vc-option", action="append", default=[], metavar="KEY=VALUE",
+                       help="converter option (repeatable), e.g. --vc-option applio_dir=~/Applio")
+
+
+def _parse_key_values(pairs: list[str], flag: str) -> dict:
     options: dict[str, object] = {}
     for pair in pairs:
         if "=" not in pair:
-            raise VoiceCloneError(f"--backend-option expects KEY=VALUE, got '{pair}'")
+            raise VoiceCloneError(f"{flag} expects KEY=VALUE, got '{pair}'")
         key, value = pair.split("=", 1)
         try:
             options[key.strip()] = json.loads(value)
         except json.JSONDecodeError:
             options[key.strip()] = value
     return options
+
+
+def _parse_backend_options(pairs: list[str]) -> dict:
+    return _parse_key_values(pairs, "--backend-option")
+
+
+def _parse_transpose(value: str) -> int | str:
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise VoiceCloneError(f"--transpose expects an integer or 'auto', got '{value}'") from None
 
 
 def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
@@ -130,6 +165,13 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         pause_between_chunks=getattr(args, "pause", 0.35),
         output_sample_rate=getattr(args, "output_sample_rate", None),
         backend_options=_parse_backend_options(getattr(args, "backend_option", []) or []),
+        voice_model=getattr(args, "voice_model", None),
+        converter=getattr(args, "vc", None),
+        transpose=_parse_transpose(getattr(args, "transpose", "0") or "0"),
+        converter_device=getattr(args, "vc_device", "auto"),
+        converter_options=_parse_key_values(
+            getattr(args, "vc_option", []) or [], "--vc-option"
+        ),
     )
     return PipelineConfig(
         language=getattr(args, "language", None),
@@ -230,6 +272,70 @@ def cmd_stress(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_voice_train(args: argparse.Namespace) -> int:
+    config = _config_from_args(args)
+    out_dir = Path(args.out)
+    profile = SpeakerProfile.load(args.profile) if args.profile else None
+    source = args.source or (profile.source_audio if profile else None)
+
+    dataset = build_training_dataset(
+        source,
+        profile=profile,
+        out_dir=Path(args.dataset_dir) if args.dataset_dir else out_dir / "dataset",
+        speaker=args.speaker or (profile.name if profile else None),
+        sample_rate=args.sample_rate,
+        max_clip_sec=args.max_clip_seconds,
+        min_clip_sec=args.min_clip_seconds,
+        overwrite=args.overwrite,
+    )
+    print(dataset.describe())
+    if args.dataset_only:
+        return 0
+
+    converter = get_converter(
+        args.vc or DEFAULT_CONVERTER,
+        device=args.vc_device,
+        sample_rate=args.sample_rate,
+        **_parse_key_values(args.vc_option or [], "--vc-option"),
+    )
+    if not type(converter).is_available():
+        raise VoiceCloneError(
+            f"voice converter '{converter.name}' is not usable here.\n{converter.install_hint}"
+        )
+    model = converter.train(
+        dataset, out_dir, name=args.name, epochs=args.epochs, resume=args.resume
+    )
+    print()
+    print(model.describe())
+    print(f"\nUse it with:  vctts speak -b silero --voice-model {out_dir} -t \"…\"")
+    return 0
+
+
+def cmd_voice_show(args: argparse.Namespace) -> int:
+    model = VoiceModel.load(args.directory)
+    if args.json:
+        print(json.dumps(model.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(model.describe())
+    return 0
+
+
+def cmd_converters(args: argparse.Namespace) -> int:
+    rows = iter_converter_info()
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        mark = "✓" if row["available"] else "✗"
+        print(f"{mark} {row['name']:<{width}}  {row['display_name']}")
+        if row["description"]:
+            print(f"  {' ' * width}  {row['description']}")
+        if not row["available"]:
+            print(f"  {' ' * width}  install:  {row['install_hint']}")
+    return 0
+
+
 def cmd_backends(args: argparse.Namespace) -> int:
     rows = list(iter_backend_info())
     if args.json:
@@ -294,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reference_options(speak)
     _add_text_options(speak)
     _add_synthesis_options(speak)
+    _add_conversion_options(speak)
     _add_common(speak)
     speak.set_defaults(func=cmd_speak)
 
@@ -332,11 +439,58 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(stress)
     stress.set_defaults(func=cmd_stress)
 
+    # voice (conversion models) ----------------------------------------------
+    voice = subparsers.add_parser("voice", help="train and inspect voice-conversion models")
+    voice_sub = voice.add_subparsers(dest="voice_command", required=True)
+
+    voice_train = voice_sub.add_parser(
+        "train", help="train a voice-conversion model on a speaker (needs a GPU)"
+    )
+    voice_train.add_argument("-o", "--out", required=True, metavar="DIR",
+                             help="where to store the trained model")
+    voice_train.add_argument("-p", "--profile", metavar="DIR",
+                             help="speaker profile to take the recording and name from")
+    voice_train.add_argument("-s", "--source", metavar="AUDIO",
+                             help="original recording (preferred over the profile clips)")
+    voice_train.add_argument("--name", help="model name (default: speaker name)")
+    voice_train.add_argument("--speaker", help="speaker id inside the dataset")
+    voice_train.add_argument("--vc", choices=["rvc", "sovits"], default=DEFAULT_CONVERTER,
+                             help=f"converter to train with (default: {DEFAULT_CONVERTER})")
+    voice_train.add_argument("--epochs", type=int, help="training epochs (default: 300)")
+    voice_train.add_argument("--sample-rate", type=int, default=40_000,
+                             help="training sample rate: 40000 for RVC, 44100 for so-vits-svc")
+    voice_train.add_argument("--max-clip-seconds", type=float, default=10.0,
+                             help="max length of one training clip (default: 10)")
+    voice_train.add_argument("--min-clip-seconds", type=float, default=2.0,
+                             help="drop clips shorter than this (default: 2)")
+    voice_train.add_argument("--dataset-dir", metavar="DIR", help="where to put the training clips")
+    voice_train.add_argument("--dataset-only", action="store_true",
+                             help="only prepare the dataset, do not train")
+    voice_train.add_argument("--resume", action="store_true", help="continue a previous run")
+    voice_train.add_argument("--overwrite", action="store_true", help="rebuild an existing dataset")
+    voice_train.add_argument("--vc-device", default="auto")
+    voice_train.add_argument("--vc-option", action="append", default=[], metavar="KEY=VALUE")
+    _add_common(voice_train)
+    voice_train.set_defaults(func=cmd_voice_train)
+
+    voice_show = voice_sub.add_parser("show", help="print a trained model summary")
+    voice_show.add_argument("directory")
+    voice_show.add_argument("--json", action="store_true")
+    _add_common(voice_show)
+    voice_show.set_defaults(func=cmd_voice_show)
+
     # listings --------------------------------------------------------------
     backends = subparsers.add_parser("backends", help="list TTS backends and their availability")
     backends.add_argument("--json", action="store_true")
     _add_common(backends)
     backends.set_defaults(func=cmd_backends)
+
+    converters = subparsers.add_parser(
+        "converters", help="list voice-conversion toolchains and their availability"
+    )
+    converters.add_argument("--json", action="store_true")
+    _add_common(converters)
+    converters.set_defaults(func=cmd_converters)
 
     languages = subparsers.add_parser("languages", help="list supported languages")
     languages.add_argument("--json", action="store_true")

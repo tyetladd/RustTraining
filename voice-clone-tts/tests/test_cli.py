@@ -85,3 +85,71 @@ def test_bad_backend_option_is_an_error(reference_wav, capsys):
 def test_unknown_language_is_an_error(capsys):
     assert run(["stress", "hi", "-l", "klingon", "-q"]) == 1
     assert "unsupported language" in capsys.readouterr().err
+
+
+def test_converters_listing(capsys):
+    assert run(["converters", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert {row["name"] for row in rows} >= {"rvc", "sovits"}
+
+
+def test_voice_train_dataset_only(reference_wav, tmp_path, capsys):
+    code = run([
+        "voice", "train", "-s", str(reference_wav), "-o", str(tmp_path / "voice"),
+        "--speaker", "anna", "--dataset-only", "--max-clip-seconds", "2", "-q",
+    ])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "clips" in out
+    assert (tmp_path / "voice" / "dataset" / "dataset_raw" / "anna").exists()
+
+
+def test_voice_show(tmp_path, capsys):
+    from voice_clone_tts.vc import VoiceModel
+
+    checkpoint = tmp_path / "m.pth"
+    checkpoint.write_bytes(b"w")
+    VoiceModel(name="anna", directory=tmp_path / "v", converter="rvc",
+               checkpoint=checkpoint, median_f0=180.0).save()
+    assert run(["voice", "show", str(tmp_path / "v"), "--json", "-q"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["name"] == "anna" and data["converter"] == "rvc"
+
+
+def test_speak_with_a_voice_model(reference_wav, tmp_path, capsys):
+    from voice_clone_tts.vc import VoiceConverter, VoiceModel, register_converter
+
+    class CliFakeConverter(VoiceConverter):
+        name = "fake-cli-vc"
+
+        @classmethod
+        def is_available(cls):
+            return True
+
+        def train(self, dataset, out_dir, **kwargs):  # pragma: no cover
+            raise NotImplementedError
+
+        def convert(self, audio, sample_rate, model, *, transpose=0):
+            return audio * 0.8
+
+    register_converter(CliFakeConverter)
+    checkpoint = tmp_path / "m.pth"
+    checkpoint.write_bytes(b"w")
+    VoiceModel(name="anna", directory=tmp_path / "v", converter="fake-cli-vc",
+               checkpoint=checkpoint).save()
+
+    out = tmp_path / "cloned.wav"
+    code = run([
+        "speak", "-v", str(reference_wav), "-t", "Привет.", "-l", "ru", "-b", "dummy",
+        "--no-asr", "--no-stress", "--voice-model", str(tmp_path / "v"),
+        "--transpose", "2", "-o", str(out), "-q",
+    ])
+    assert code == 0 and out.exists()
+    assert "voice     : anna (transpose +2)" in capsys.readouterr().out
+
+
+def test_bad_transpose_is_an_error(reference_wav, capsys):
+    code = run(["speak", "-v", str(reference_wav), "-t", "x", "-b", "dummy",
+                "--transpose", "sideways", "-q"])
+    assert code == 1
+    assert "--transpose" in capsys.readouterr().err

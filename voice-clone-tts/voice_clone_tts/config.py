@@ -74,6 +74,16 @@ class SynthesisConfig:
     fade_ms: float = 10.0
     backend_options: dict[str, Any] = field(default_factory=dict)
 
+    # -- voice conversion (cloning on top of a backend with fixed voices) --
+    voice_model: str | None = None
+    """Directory of a trained voice-conversion model; ``None`` disables the stage."""
+    converter: str | None = None
+    """Converter name; ``None`` takes the one recorded in the voice model."""
+    transpose: int | str = 0
+    """Semitones to shift, or ``"auto"`` to match the target speaker's pitch."""
+    converter_device: str = "auto"
+    converter_options: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class PipelineConfig:

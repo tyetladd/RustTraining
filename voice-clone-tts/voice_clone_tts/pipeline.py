@@ -29,6 +29,7 @@ from voice_clone_tts.text.chunking import split_into_chunks
 from voice_clone_tts.text.languages import LanguageSpec, get_language, normalize_code
 from voice_clone_tts.text.normalize import normalize_text
 from voice_clone_tts.text.stress import StressStyle, put_stress
+from voice_clone_tts.vc import VoiceConverter, VoiceModel, get_converter
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class SynthesisResult:
     chunks: list[str]
     prepared_text: str
     profile: SpeakerProfile | None = None
+    voice_model: str | None = None
+    transpose: int = 0
     output_path: Path | None = None
     timings: dict[str, float] = field(default_factory=dict)
 
@@ -62,6 +65,8 @@ class SynthesisResult:
             f"chunks    : {len(self.chunks)}",
             f"duration  : {self.duration:.2f}s @ {self.sample_rate} Hz",
         ]
+        if self.voice_model:
+            lines.append(f"voice     : {self.voice_model} (transpose {self.transpose:+d})")
         if self.output_path:
             lines.append(f"output    : {self.output_path}")
         if self.timings:
@@ -145,6 +150,47 @@ def _resolve_language(
     return get_language(config.fallback_language)
 
 
+def _resolve_converter(config: PipelineConfig) -> tuple[VoiceConverter, VoiceModel] | None:
+    """Load the trained voice-conversion model, if one is configured."""
+    synth_cfg = config.synthesis
+    if not synth_cfg.voice_model:
+        return None
+    model = VoiceModel.load(synth_cfg.voice_model)
+    name = synth_cfg.converter or model.converter
+    if not name:
+        raise BackendError(
+            f"voice model {synth_cfg.voice_model} does not say which converter made it; "
+            "pass --vc rvc|sovits"
+        )
+    converter = get_converter(
+        name, device=synth_cfg.converter_device, **synth_cfg.converter_options
+    )
+    if not type(converter).is_available():
+        raise BackendError(
+            f"voice converter '{name}' is not usable here.\n{converter.install_hint}"
+        )
+    converter.load(model)
+    return converter, model
+
+
+def _resolve_transpose(setting: int | str, rendered: list[np.ndarray], sample_rate: int,
+                       model: VoiceModel) -> int:
+    """Turn ``transpose="auto"`` into semitones from synthesized to target pitch."""
+    if setting != "auto":
+        return int(setting)
+    if not model.median_f0:
+        log.warning("voice model '%s' has no reference pitch; using transpose 0", model.name)
+        return 0
+    source_f0 = audio_utils.estimate_f0(
+        np.concatenate([chunk for chunk in rendered[:3] if chunk.size]), sample_rate
+    )
+    shift = audio_utils.semitones_between(source_f0, model.median_f0)
+    shift = max(-24, min(24, shift))
+    log.info("auto transpose: %.0f Hz -> %.0f Hz = %+d semitones",
+             source_f0, model.median_f0, shift)
+    return shift
+
+
 def synthesize(
     voice: str | Path | None = None,
     text: str = "",
@@ -198,7 +244,10 @@ def synthesize(
 
     started = time.perf_counter()
     engine.ensure_loaded()
+    conversion = _resolve_converter(config)
     timings["load"] = time.perf_counter() - started
+    if conversion is None and speaker is not None and not engine.clones_voice:
+        log.info("no --voice-model given, so the output keeps the backend's own voice")
 
     synth_cfg = config.synthesis
     rendered: list[np.ndarray] = []
@@ -228,6 +277,23 @@ def synthesize(
     if not rendered:
         raise BackendError(f"backend '{engine.name}' returned no audio for this text")
 
+    transpose = 0
+    if conversion is not None:
+        converter, voice_model = conversion
+        started = time.perf_counter()
+        transpose = _resolve_transpose(
+            synth_cfg.transpose, rendered, engine.sample_rate, voice_model
+        )
+        try:
+            rendered = [
+                converter.convert(chunk, engine.sample_rate, voice_model, transpose=transpose)
+                for chunk in rendered
+            ]
+        finally:
+            converter.close()
+        timings["conversion"] = time.perf_counter() - started
+        log.info("converted %d chunk(s) into the voice of '%s'", len(rendered), voice_model.name)
+
     audio = audio_utils.concat_with_pause(rendered, engine.sample_rate, synth_cfg.pause_between_chunks)
     sample_rate = engine.sample_rate
     if synth_cfg.output_sample_rate and synth_cfg.output_sample_rate != sample_rate:
@@ -244,6 +310,8 @@ def synthesize(
         chunks=chunks,
         prepared_text=prepared,
         profile=speaker,
+        voice_model=(conversion[1].name if conversion else None),
+        transpose=transpose,
         timings=timings,
     )
     if out_path:

@@ -296,6 +296,57 @@ def trim_silence(
     return audio[start:end]
 
 
+def estimate_f0(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    fmin: float = 60.0,
+    fmax: float = 400.0,
+    frame_ms: float = 40.0,
+) -> float:
+    """Median fundamental frequency over voiced frames, in Hz (0.0 if unvoiced).
+
+    Plain autocorrelation: good enough to compare two speakers and pick a
+    semitone shift, not a replacement for CREPE or RMVPE.
+    """
+    audio = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
+    frame = int(sample_rate * frame_ms / 1000.0)
+    if audio.size < frame or frame < 2:
+        return 0.0
+    hop = frame // 2
+    lag_min, lag_max = int(sample_rate / fmax), int(sample_rate / fmin)
+    if lag_min < 1 or lag_max >= frame:
+        return 0.0
+
+    energy = _frame_energy_db(audio, frame, hop)
+    threshold = float(energy.max()) - 25.0
+    pitches: list[float] = []
+    for index, level in enumerate(energy):
+        if level <= threshold:
+            continue
+        window = audio[index * hop : index * hop + frame]
+        window = window - float(window.mean())
+        correlation = np.correlate(window, window, mode="full")[frame - 1 :]
+        if correlation[0] <= 0:
+            continue
+        candidate = correlation[lag_min:lag_max]
+        if candidate.size == 0:
+            continue
+        lag = int(np.argmax(candidate)) + lag_min
+        # Reject frames where the "peak" is just noise.
+        if correlation[lag] / correlation[0] < 0.3:
+            continue
+        pitches.append(sample_rate / lag)
+    return float(np.median(pitches)) if pitches else 0.0
+
+
+def semitones_between(source_hz: float, target_hz: float) -> int:
+    """Whole semitones from `source_hz` to `target_hz` (0 when either is unknown)."""
+    if source_hz <= 0 or target_hz <= 0:
+        return 0
+    return int(round(12.0 * np.log2(target_hz / source_hz)))
+
+
 @dataclass(frozen=True)
 class SpeechSegment:
     """A region of the reference recording that contains speech."""
