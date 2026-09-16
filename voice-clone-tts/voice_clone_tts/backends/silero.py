@@ -24,10 +24,18 @@ from voice_clone_tts.text.stress import StressStyle
 log = logging.getLogger(__name__)
 
 # language code -> (torch.hub model id, default voice)
+# Russian v5 models carry built-in stress/homograph handling and SSML; we feed
+# them text that silero-stress already marked, so their own accentuation stays
+# off. Other ids (v5_ru … v5_5_ru, v4_ru, v5_cis_base) work via
+# --backend-option model_id=…
 SILERO_MODELS = {
-    "ru": ("v4_ru", "xenia"),
+    "ru": ("v5_5_ru", "xenia"),
     "en": ("v3_en", "en_0"),
     "uk": ("v4_ua", "mykyta"),
+}
+SILERO_VOICES = {
+    "ru": ("aidar", "baya", "kseniya", "xenia", "eugene"),
+    "uk": ("mykyta",),
 }
 SILERO_SAMPLE_RATES = (8_000, 24_000, 48_000)
 
@@ -38,7 +46,8 @@ class SileroBackend(TTSBackend):
 
     name = "silero"
     display_name = "Silero TTS (preset voices)"
-    description = "Fast CPU TTS with native '+' stress support — does NOT clone the reference voice"
+    description = ("Fast CPU TTS with native '+' stress support; stock speakers only — "
+                   "it cannot clone the reference voice")
     supported_languages = set(SILERO_MODELS)
     requires_reference = False
     clones_voice = False
@@ -102,19 +111,23 @@ class SileroBackend(TTSBackend):
         language_code = request.language.code
         model = self._model_for(language_code)
         voice = self.voice or SILERO_MODELS[language_code][1]
+        known = SILERO_VOICES.get(language_code)
+        if known and self.voice and self.voice not in known:
+            log.warning("voice '%s' is not a stock %s speaker %s; the model may reject it",
+                        self.voice, language_code, known)
 
         if request.profile is not None and request.profile.reference_files:
             log.debug("silero ignores the reference voice; speaking as '%s'", voice)
 
-        # Text already carries "+" marks from silero-stress, so let the model
-        # keep them instead of running its own (weaker) accentuation.
-        audio = model.apply_tts(
-            text=request.text,
-            speaker=voice,
-            sample_rate=self.sample_rate,
-            put_accent=False,
-            put_yo=False,
-        )
+        # The text already carries "+" marks from silero-stress, so the model's
+        # own accentuation is switched off where that flag still exists (v3/v4);
+        # v5 dropped it and stresses only what is not marked already.
+        kwargs = dict(text=request.text, speaker=voice, sample_rate=self.sample_rate)
+        try:
+            audio = model.apply_tts(**kwargs, put_accent=False, put_yo=False)
+        except TypeError:
+            log.debug("apply_tts has no put_accent/put_yo (v5 model), calling without them")
+            audio = model.apply_tts(**kwargs)
         if hasattr(audio, "detach"):
             audio = audio.detach().cpu().numpy()
         wav = np.asarray(audio, dtype=np.float32).reshape(-1)

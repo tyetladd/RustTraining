@@ -85,3 +85,33 @@ def test_silero_consumes_plus_marks():
 def test_silero_rejects_bad_sample_rates():
     with pytest.raises(BackendError):
         get_backend("silero", sample_rate=44_100)
+
+
+def test_silero_defaults_to_a_v5_russian_model():
+    from voice_clone_tts.backends.silero import SILERO_MODELS
+
+    model_id, voice = SILERO_MODELS["ru"]
+    assert model_id.startswith("v5_")
+    assert voice in {"aidar", "baya", "kseniya", "xenia", "eugene"}
+
+
+def test_silero_retries_without_v4_only_flags(monkeypatch):
+    """v5 models dropped put_accent/put_yo — the backend must cope."""
+    from voice_clone_tts.backends.silero import SileroBackend
+
+    calls = []
+
+    class FakeV5Model:
+        def apply_tts(self, text, speaker, sample_rate, **kwargs):
+            calls.append(kwargs)
+            if kwargs:
+                raise TypeError("unexpected keyword argument 'put_accent'")
+            return np.zeros(sample_rate // 10, dtype=np.float32)
+
+    backend = SileroBackend()
+    monkeypatch.setattr(backend, "_model_for", lambda code: FakeV5Model())
+    wav = backend.synthesize(
+        SynthesisRequest(text="гот+ов", language=get_language("ru"))
+    )
+    assert [bool(kwargs) for kwargs in calls] == [True, False]
+    assert wav.size > 0
