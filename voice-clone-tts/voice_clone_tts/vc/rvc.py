@@ -406,6 +406,16 @@ class RVCConverter(VoiceConverter):
         )
 
     @staticmethod
+    def _ensure_applio_config(checkout: Path) -> None:
+        """Applio's GUI creates assets/config.json on first start; the headless
+        train path doesn't, and extract_model() reads it for the author field,
+        printing "An error occurred extracting the model" for every checkpoint."""
+        config = checkout / "assets" / "config.json"
+        template = checkout / "assets" / "config_template.json"
+        if not config.exists() and template.exists():
+            shutil.copy2(template, config)
+
+    @staticmethod
     def _collect_artifacts(logs_dir: Path) -> tuple[Path, Path | None]:
         weights = [p for p in logs_dir.glob("*.pth") if not p.name.startswith(("G_", "D_"))]
         if not weights:
@@ -431,6 +441,7 @@ class RVCConverter(VoiceConverter):
                 f"unknown stage '{stop_after}'. Known: {', '.join(STAGES)}"
             )
         checkout = self._checkout()
+        self._ensure_applio_config(checkout)
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         name = name or dataset.speaker
