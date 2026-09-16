@@ -1,0 +1,20 @@
+{
+  "languages": [
+    {
+      "code": "de",
+      "name": "German",
+      "aliases": ["deu", "de-de"],
+      "whisper_code": "de",
+      "xtts_code": "de",
+      "normalizer": "generic",
+      "sentence_max_chars": 220
+    },
+    {
+      "code": "kk",
+      "name": "Kazakh",
+      "aliases": ["kaz"],
+      "whisper_code": "kk",
+      "normalizer": "generic"
+    }
+  ]
+}

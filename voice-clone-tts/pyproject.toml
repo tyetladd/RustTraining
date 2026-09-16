@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-clone-tts"
+version = "0.1.0"
+description = "Clone a voice from an MP3 sample and speak arbitrary Russian/English text with it"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "soxr>=0.3",
+]
+
+[project.optional-dependencies]
+# Stress/ё placement for Russian (and ukr/bel) — https://github.com/snakers4/silero-stress
+stress = ["silero-stress>=1.5", "torch>=1.12"]
+# Reference-audio transcription and language detection
+asr = ["faster-whisper>=1.0"]
+# Zero-shot voice cloning backend (XTTS-v2 via the maintained Coqui fork)
+xtts = ["coqui-tts>=0.25", "torch>=2.1", "torchaudio>=2.1"]
+# Non-cloning Silero TTS backend (great Russian prosody, consumes "+" stress marks natively)
+silero = ["torch>=1.12"]
+dev = ["pytest>=7.4"]
+all = [
+    "silero-stress>=1.5",
+    "faster-whisper>=1.0",
+    "coqui-tts>=0.25",
+    "torch>=2.1",
+    "torchaudio>=2.1",
+]
+
+[project.scripts]
+vctts = "voice_clone_tts.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["voice_clone_tts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
