@@ -465,3 +465,10 @@ def test_timeout_kills_the_whole_process_tree(tmp_path):
     else:
         os.kill(grandchild, 9)
         pytest.fail(f"grandchild {grandchild} survived the timeout")
+
+
+def test_rvc_uses_every_cpu_core_by_default(monkeypatch):
+    """Preprocessing on a cloud box has no one to share cores with."""
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.os.cpu_count", lambda: 4)
+    assert RVCConverter().cpu_cores == 4
+    assert RVCConverter(cpu_cores=2).cpu_cores == 2

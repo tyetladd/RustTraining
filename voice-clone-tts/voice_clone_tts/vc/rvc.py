@@ -84,7 +84,9 @@ class RVCConverter(VoiceConverter):
         self.f0_method = options.get("f0_method", "rmvpe")
         self.batch_size = int(options.get("batch_size", 8))
         self.save_every_epoch = int(options.get("save_every_epoch", 50))
-        self.cpu_cores = int(options.get("cpu_cores", max(1, (os.cpu_count() or 4) // 2)))
+        # Препроцессинг и извлечение признаков — пакетная работа на выделенной
+        # машине, делить её не с кем: берём все ядра.
+        self.cpu_cores = int(options.get("cpu_cores", os.cpu_count() or 2))
         self.index_rate = float(options.get("index_rate", 0.3))
         self.protect = float(options.get("protect", 0.33))
         self.volume_envelope = float(options.get("volume_envelope", 1.0))
