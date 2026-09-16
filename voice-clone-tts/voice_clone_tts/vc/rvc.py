@@ -122,6 +122,9 @@ class RVCConverter(VoiceConverter):
         self.protect = float(options.get("protect", 0.33))
         self.volume_envelope = float(options.get("volume_envelope", 1.0))
         self.python = options.get("python", sys.executable)
+        self.gpus = options.get("gpus")
+        """Какие карты отдать Applio: ``None`` — первая, ``"all"`` — все видимые,
+        либо явная строка в его формате (``"0-1"``, ``"-"`` для CPU)."""
         self.vocoder = options.get("vocoder", "HiFi-GAN")
         self.prerequisites = bool(options.get("prerequisites", True))
         self.logs_dir = options.get("logs_dir")
@@ -145,7 +148,38 @@ class RVCConverter(VoiceConverter):
             )
         return self.applio_dir
 
+    @staticmethod
+    def _cuda_devices() -> list[int]:
+        try:
+            import torch
+
+            return list(range(torch.cuda.device_count()))
+        except Exception:  # noqa: BLE001 - torch не обязателен
+            return []
+
     def _gpu_argument(self) -> str:
+        """Значение ``--gpu`` для Applio: индексы через дефис либо ``-`` для CPU.
+
+        train.py разбирает эту строку как список карт и поднимает по процессу
+        на каждую (DDP, nccl), extract.py так же делит между ними файлы.
+        """
+        if self.gpus is not None:
+            requested = str(self.gpus).strip()
+            if requested.lower() != "all":
+                return requested
+            devices = self._cuda_devices()
+            if not devices:
+                log.warning("gpus='all', но CUDA-устройств не видно — считаем на CPU")
+                return "-"
+            if len(devices) > 1:
+                log.info(
+                    "обучение на %d картах: эффективный батч будет %d (%d на карту). "
+                    "Шагов на эпоху станет вдвое меньше, так что при том же числе эпох "
+                    "модель получит вдвое меньше обновлений — их стоит добавить",
+                    len(devices), self.batch_size * len(devices), self.batch_size,
+                )
+            return "-".join(str(index) for index in devices)
+
         device = self.resolve_device()
         if device.startswith("cuda"):
             _, _, index = device.partition(":")

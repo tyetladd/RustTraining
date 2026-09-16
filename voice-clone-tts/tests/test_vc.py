@@ -786,3 +786,48 @@ def test_prerequisites_can_be_disabled(applio, reference_wav, tmp_path, monkeypa
         _dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10
     )
     assert "prerequisites" not in [command[2] for command in runner.commands]
+
+
+# --------------------------------------------------------------------------
+# more than one GPU
+# --------------------------------------------------------------------------
+
+def test_gpu_argument_defaults_to_a_single_card(applio, monkeypatch):
+    monkeypatch.setattr(RVCConverter, "resolve_device", lambda self: "cuda:0")
+    assert RVCConverter()._gpu_argument() == "0"
+
+
+def test_gpu_argument_can_take_every_visible_card(applio, monkeypatch):
+    monkeypatch.setattr(RVCConverter, "_cuda_devices", staticmethod(lambda: [0, 1]))
+    assert RVCConverter(gpus="all")._gpu_argument() == "0-1"
+
+
+def test_gpu_argument_accepts_an_explicit_list(applio):
+    assert RVCConverter(gpus="0-1")._gpu_argument() == "0-1"
+    assert RVCConverter(gpus="-")._gpu_argument() == "-"
+
+
+def test_gpu_all_falls_back_to_cpu_without_cuda(applio, monkeypatch, caplog):
+    monkeypatch.setattr(RVCConverter, "_cuda_devices", staticmethod(list))
+    with caplog.at_level("WARNING"):
+        assert RVCConverter(gpus="all")._gpu_argument() == "-"
+    assert "CUDA-устройств не видно" in caplog.text
+
+
+def test_multi_gpu_warns_about_the_effective_batch(applio, monkeypatch, caplog):
+    monkeypatch.setattr(RVCConverter, "_cuda_devices", staticmethod(lambda: [0, 1]))
+    with caplog.at_level("INFO"):
+        RVCConverter(gpus="all", batch_size=8)._gpu_argument()
+    assert "эффективный батч будет 16" in caplog.text
+
+
+def test_both_stages_get_the_same_devices(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+    monkeypatch.setattr(RVCConverter, "_cuda_devices", staticmethod(lambda: [0, 1]))
+
+    RVCConverter(gpus="all").train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=1)
+
+    for command in runner.commands:
+        if command[2] in {"extract", "train"}:
+            assert command[command.index("--gpu") + 1] == "0-1"
