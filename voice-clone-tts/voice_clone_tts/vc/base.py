@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 MODEL_FILE = "voice_model.json"
 MODEL_FORMAT = 1
 
+STAGES = ("dataset", "preprocess", "extract", "train")
+"""Стадии обучения по порядку; на любой можно остановиться.
+
+Нужно для проверки конвейера там, где нет CUDA: нарезка и извлечение
+признаков считаются на CPU, а обучение — нет.
+"""
+
 
 class VoiceConversionError(VoiceCloneError):
     """A voice conversion model is unusable, unknown or failed."""
@@ -187,8 +194,13 @@ class VoiceConverter(ABC):
         name: str | None = None,
         epochs: int | None = None,
         resume: bool = False,
+        stop_after: str | None = None,
     ) -> VoiceModel:
-        """Train a model on `dataset` and return it."""
+        """Train a model on `dataset` and return it.
+
+        With `stop_after` set to a stage from :data:`STAGES`, the run stops
+        once that stage is done and returns a model without a checkpoint.
+        """
 
     @abstractmethod
     def convert(

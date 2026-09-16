@@ -31,6 +31,7 @@ import numpy as np
 
 from voice_clone_tts import audio as audio_utils
 from voice_clone_tts.vc.base import (
+    STAGES,
     VoiceConversionError,
     VoiceConverter,
     VoiceModel,
@@ -61,6 +62,11 @@ APPLIO_FAILURE_PATTERNS = (
 SLICED_DIR = "sliced_audios"
 FEATURES_DIR = "extracted"
 FILELIST = "filelist.txt"
+STAGE_DIRS = (SLICED_DIR, FEATURES_DIR, "f0", "f0_voiced")
+"""generate_filelist() берёт ПЕРЕСЕЧЕНИЕ имён из этих четырёх папок.
+
+Пустая любая из них — и filelist.txt оказывается пустым, а обучение
+останавливается на «Not enough data», не сказав, чего именно не хватило."""
 MIN_BATCHES = 3
 """train.py останавливается, если батчей меньше трёх — отсюда минимум фрагментов."""
 
@@ -185,6 +191,24 @@ class RVCConverter(VoiceConverter):
         )
 
     # -- training ---------------------------------------------------------
+    def _partial_model(self, name, out_dir, dataset, logs_dir, stage, stats) -> VoiceModel:
+        """Модель без весов: конвейер намеренно остановлен на `stage`."""
+        log.info("остановка после стадии '%s' — весов не будет", stage)
+        model = VoiceModel(
+            name=name,
+            directory=Path(out_dir),
+            converter=self.name,
+            speaker=dataset.speaker,
+            sample_rate=self.sample_rate,
+            source_profile=dataset.source,
+            median_f0=dataset.median_f0,
+            created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            train_stats={"stopped_after": stage, **stats},
+            metadata={"logs_dir": str(logs_dir)},
+        )
+        model.save()
+        return model
+
     def _require_slices(self, logs_dir: Path, name: str) -> int:
         """Убедиться, что preprocess действительно нарезал аудио.
 
@@ -207,20 +231,43 @@ class RVCConverter(VoiceConverter):
         return len(sliced)
 
     def _require_features(self, logs_dir: Path, name: str) -> int:
-        """Убедиться, что extract дал признаки и что их хватит на обучение."""
-        features = sorted((logs_dir / FEATURES_DIR).glob("*"))
+        """Убедиться, что extract дал всё, из чего собирается filelist.
+
+        Applio строит filelist.txt как пересечение имён в четырёх папках, и
+        если хоть одна пуста, список выходит пустым, а обучение падает с
+        «Not enough data present in the training set» — без единого намёка,
+        какой именно стадии не хватило. Повторяем ту же логику здесь.
+        """
+        stems: dict[str, set[str]] = {}
+        for directory in STAGE_DIRS:
+            path = logs_dir / directory
+            stems[directory] = (
+                {item.name.split(".")[0] for item in path.glob("*")} if path.is_dir() else set()
+            )
+        common = set.intersection(*stems.values()) if stems else set()
+        counts = ", ".join(f"{directory}: {len(names)}" for directory, names in stems.items())
+
         filelist = logs_dir / FILELIST
         entries = (
             [line for line in filelist.read_text(encoding="utf-8").splitlines() if line.strip()]
             if filelist.exists()
             else []
         )
-        if not features or not entries:
+
+        if not common or not entries:
+            empty = [directory for directory, names in stems.items() if not names]
+            reason = (
+                f"пусто в {', '.join(empty)}" if empty
+                else "имена файлов в этих папках не совпадают"
+            )
             raise VoiceConversionError(
-                f"extract не подготовил данные для обучения в {logs_dir}:\n"
-                f"  признаков в {FEATURES_DIR}/: {len(features)}\n"
-                f"  строк в {FILELIST}: {len(entries)}\n"
-                "Причина — в строках [applio extract] выше."
+                f"extract не подготовил данные для обучения в {logs_dir}.\n"
+                f"  {counts}\n"
+                f"  общих имён: {len(common)}, строк в {FILELIST}: {len(entries)}\n"
+                f"Причина: {reason}.\n"
+                "Applio собирает filelist.txt как пересечение имён этих четырёх папок, "
+                "поэтому пустая любая из них обнуляет обучение. Ищите ошибку в строках "
+                "[applio extract] выше (f0 считается на rmvpe и требует скачанной модели)."
             )
 
         minimum = MIN_BATCHES * self.batch_size
@@ -234,7 +281,7 @@ class RVCConverter(VoiceConverter):
                 f"Варианты: уменьшить batch_size (--vc-option batch_size="
                 f"{max(1, len(entries) // MIN_BATCHES)}) или записать больше речи."
             )
-        log.info("extract: %d фрагментов, %d строк в %s", len(features), len(entries), FILELIST)
+        log.info("extract: %s; строк в %s: %d", counts, FILELIST, len(entries))
         return len(entries)
 
     @staticmethod
@@ -271,7 +318,12 @@ class RVCConverter(VoiceConverter):
         name: str | None = None,
         epochs: int | None = None,
         resume: bool = False,
+        stop_after: str | None = None,
     ) -> VoiceModel:
+        if stop_after is not None and stop_after not in STAGES:
+            raise VoiceConversionError(
+                f"unknown stage '{stop_after}'. Known: {', '.join(STAGES)}"
+            )
         checkout = self._checkout()
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -288,7 +340,10 @@ class RVCConverter(VoiceConverter):
                 "--cpu-cores", self.cpu_cores,
                 label="applio preprocess",
             )
-            self._require_slices(logs_dir, name)
+            slices = self._require_slices(logs_dir, name)
+            if stop_after == "preprocess":
+                return self._partial_model(name, out_dir, dataset, logs_dir, "preprocess",
+                                           {"slices": slices})
             self._core(
                 "extract",
                 "--model-name", name,
@@ -298,7 +353,10 @@ class RVCConverter(VoiceConverter):
                 "--gpu", self._gpu_argument(),
                 label="applio extract",
             )
-            self._require_features(logs_dir, name)
+            entries = self._require_features(logs_dir, name)
+            if stop_after == "extract":
+                return self._partial_model(name, out_dir, dataset, logs_dir, "extract",
+                                           {"filelist_entries": entries})
 
         log.info("training RVC model '%s' for %d epochs — this is the long part", name, epochs)
         self._core(

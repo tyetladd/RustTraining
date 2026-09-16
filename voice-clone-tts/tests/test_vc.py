@@ -261,11 +261,13 @@ class FakeApplio:
     preprocess or extract would.
     """
 
-    def __init__(self, checkout: Path, *, slices: int = 40, entries: int = 40):
+    def __init__(self, checkout: Path, *, slices: int = 40, entries: int = 40,
+                 skip_dirs: tuple[str, ...] = ()):
         self.checkout = checkout
         self.commands: list[list[str]] = []
         self.slices = slices
         self.entries = entries
+        self.skip_dirs = skip_dirs
 
     def __call__(self, args, *, cwd=None, env=None, timeout=None, label="", check=True, **kwargs):
         args = [str(arg) for arg in args]
@@ -279,12 +281,18 @@ class FakeApplio:
             for index in range(self.slices):
                 (sliced / f"0_{index}.wav").write_bytes(b"wav")
         elif step == "extract":
-            extracted = logs / "extracted"
-            extracted.mkdir(parents=True, exist_ok=True)
-            for index in range(self.entries):
-                (extracted / f"0_{index}.npy").write_bytes(b"npy")
+            for directory, suffix in (("extracted", ".npy"), ("f0", ".wav.npy"),
+                                      ("f0_voiced", ".wav.npy")):
+                if directory in self.skip_dirs:
+                    (logs / directory).mkdir(parents=True, exist_ok=True)
+                    continue
+                target = logs / directory
+                target.mkdir(parents=True, exist_ok=True)
+                for index in range(self.entries):
+                    (target / f"0_{index}{suffix}").write_bytes(b"data")
+            written = 0 if self.skip_dirs or not self.entries else self.entries
             (logs / "filelist.txt").write_text(
-                "\n".join(f"line {i}" for i in range(self.entries)), encoding="utf-8"
+                "\n".join(f"line {i}" for i in range(written)), encoding="utf-8"
             )
         elif step == "train":
             logs.mkdir(parents=True, exist_ok=True)
@@ -627,3 +635,61 @@ def test_applio_failure_patterns_cover_the_silent_stops():
 
     assert any("not enough data" in p.lower() for p in APPLIO_FAILURE_PATTERNS)
     assert any("no audio files found" in p.lower() for p in APPLIO_FAILURE_PATTERNS)
+
+
+# --------------------------------------------------------------------------
+# stopping before the GPU-only stage (for machines without CUDA)
+# --------------------------------------------------------------------------
+
+def test_rvc_can_stop_after_preprocess(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    model = RVCConverter().train(
+        _dataset(reference_wav, tmp_path), tmp_path / "voice", stop_after="preprocess"
+    )
+    assert [c[2] for c in runner.commands] == ["preprocess"]
+    assert model.checkpoint is None
+    assert model.train_stats == {"stopped_after": "preprocess", "slices": 40}
+    assert (tmp_path / "voice" / "voice_model.json").exists()
+
+
+def test_rvc_can_stop_after_extract(applio, reference_wav, tmp_path, monkeypatch):
+    runner = FakeApplio(applio)
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    model = RVCConverter().train(
+        _dataset(reference_wav, tmp_path), tmp_path / "voice", stop_after="extract"
+    )
+    assert [c[2] for c in runner.commands] == ["preprocess", "extract"]
+    assert model.train_stats["stopped_after"] == "extract"
+    assert model.train_stats["filelist_entries"] == 40
+
+
+def test_rvc_rejects_an_unknown_stage(applio, reference_wav, tmp_path):
+    with pytest.raises(VoiceConversionError, match="unknown stage"):
+        RVCConverter().train(None, tmp_path / "voice", stop_after="nonsense")
+
+
+def test_partial_model_loads_back(applio, reference_wav, tmp_path, monkeypatch):
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", FakeApplio(applio))
+    RVCConverter().train(
+        _dataset(reference_wav, tmp_path), tmp_path / "voice", stop_after="extract"
+    )
+    loaded = VoiceModel.load(tmp_path / "voice")
+    assert loaded.checkpoint is None and loaded.train_stats["stopped_after"] == "extract"
+
+
+def test_rvc_names_the_empty_stage_directory(applio, reference_wav, tmp_path, monkeypatch):
+    """The real failure: 268 slices, 268 features, but f0 empty -> empty filelist."""
+    runner = FakeApplio(applio, skip_dirs=("f0", "f0_voiced"))
+    monkeypatch.setattr("voice_clone_tts.vc.rvc.run_command", runner)
+
+    with pytest.raises(VoiceConversionError) as excinfo:
+        RVCConverter().train(_dataset(reference_wav, tmp_path), tmp_path / "voice", epochs=10)
+
+    message = str(excinfo.value)
+    assert "пусто в f0, f0_voiced" in message
+    assert "sliced_audios: 40" in message and "extracted: 40" in message
+    assert "rmvpe" in message
+    assert [c[2] for c in runner.commands] == ["preprocess", "extract"]  # train не запускался

@@ -112,6 +112,7 @@ class SoVitsConverter(VoiceConverter):
         name: str | None = None,
         epochs: int | None = None,
         resume: bool = False,
+        stop_after: str | None = None,
     ) -> VoiceModel:
         binary = self._svc()
         out_dir = Path(out_dir)
@@ -140,10 +141,28 @@ class SoVitsConverter(VoiceConverter):
             )
             train_config = self._patch_config(config_path, epochs)
             log.info("training config: %s", {k: train_config.get(k) for k in ("epochs", "batch_size")})
+            if stop_after == "preprocess":
+                log.info("остановка после подготовки датасета — весов не будет")
+                return VoiceModel(
+                    name=name, directory=out_dir, converter=self.name,
+                    config=config_path, speaker=dataset.speaker,
+                    sample_rate=self.sample_rate, source_profile=dataset.source,
+                    median_f0=dataset.median_f0,
+                    train_stats={"stopped_after": "preprocess"},
+                )
             run_command(
                 [binary, "pre-hubert", "-i", prepared, "-c", config_path, "-fm", self.f0_method],
                 label="svc pre-hubert", timeout=self.timeout,
             )
+            if stop_after == "extract":
+                log.info("остановка после извлечения признаков — весов не будет")
+                return VoiceModel(
+                    name=name, directory=out_dir, converter=self.name,
+                    config=config_path, speaker=dataset.speaker,
+                    sample_rate=self.sample_rate, source_profile=dataset.source,
+                    median_f0=dataset.median_f0,
+                    train_stats={"stopped_after": "extract"},
+                )
         else:
             if not config_path.exists():
                 raise VoiceConversionError(

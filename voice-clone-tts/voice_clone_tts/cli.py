@@ -301,7 +301,8 @@ def cmd_voice_train(args: argparse.Namespace) -> int:
         reuse_existing=args.resume,
     )
     print(dataset.describe())
-    if args.dataset_only:
+    stop_after = "dataset" if args.dataset_only else args.stop_after
+    if stop_after == "dataset":
         return 0
 
     converter = get_converter(
@@ -315,11 +316,16 @@ def cmd_voice_train(args: argparse.Namespace) -> int:
             f"voice converter '{converter.name}' is not usable here.\n{converter.install_hint}"
         )
     model = converter.train(
-        dataset, out_dir, name=args.name, epochs=args.epochs, resume=args.resume
+        dataset, out_dir, name=args.name, epochs=args.epochs, resume=args.resume,
+        stop_after=stop_after,
     )
     print()
     print(model.describe())
-    print(f"\nUse it with:  vctts speak -b silero --voice-model {out_dir} -t \"…\"")
+    if model.checkpoint is None:
+        print(f"\nконвейер остановлен на стадии '{stop_after}': весов нет, "
+              "это проверка подготовки данных")
+    else:
+        print(f"\nUse it with:  vctts speak -b silero --voice-model {out_dir} -t \"…\"")
     return 0
 
 
@@ -490,7 +496,10 @@ def build_parser() -> argparse.ArgumentParser:
                              help="drop clips shorter than this (default: 2)")
     voice_train.add_argument("--dataset-dir", metavar="DIR", help="where to put the training clips")
     voice_train.add_argument("--dataset-only", action="store_true",
-                             help="only prepare the dataset, do not train")
+                             help="same as --stop-after dataset")
+    voice_train.add_argument("--stop-after", choices=["dataset", "preprocess", "extract"],
+                             help="stop once that stage is done; preprocess and extract "
+                                  "run on CPU, so this verifies the pipeline without a GPU")
     voice_train.add_argument("--resume", action="store_true", help="continue a previous run")
     voice_train.add_argument("--overwrite", action="store_true", help="rebuild an existing dataset")
     voice_train.add_argument("--vc-device", default="auto")
