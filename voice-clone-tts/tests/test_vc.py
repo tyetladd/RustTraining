@@ -1,6 +1,8 @@
 """Voice conversion layer: dataset, model metadata, drivers, pipeline wiring."""
 
 import json
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -412,3 +414,54 @@ def test_reuse_falls_through_to_a_normal_build(reference_wav, tmp_path):
         max_clip_sec=2.0, min_clip_sec=0.4, reuse_existing=True,
     )
     assert dataset.clips  # nothing on disk yet, so it is built from the recording
+
+
+# --------------------------------------------------------------------------
+# time budget: a cloud session ends on a hard limit
+# --------------------------------------------------------------------------
+
+def test_run_command_streams_and_returns_output():
+    result = run_command(
+        ["python3", "-c", "print('hello'); print('world')"], label="test", timeout=30
+    )
+    assert result.ok and result.tail == ["hello", "world"]
+
+
+def test_run_command_stops_a_chatty_process_at_the_deadline():
+    """The old implementation blocked in the read loop and never timed out."""
+    script = "import time\nwhile True:\n    print('working', flush=True)\n    time.sleep(0.05)\n"
+    started = time.monotonic()
+    with pytest.raises(ToolchainError, match="time budget"):
+        run_command(["python3", "-c", script], label="chatty", timeout=1.0)
+    assert time.monotonic() - started < 15.0
+    
+    
+def test_run_command_stops_a_silent_process_at_the_deadline():
+    started = time.monotonic()
+    with pytest.raises(ToolchainError, match="time budget"):
+        run_command(["python3", "-c", "import time; time.sleep(60)"], label="quiet", timeout=1.0)
+    assert time.monotonic() - started < 15.0
+
+
+def test_timeout_kills_the_whole_process_tree(tmp_path):
+    """Applio spawns its trainer as a child; orphaning it would keep the GPU busy."""
+    pid_file = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "while True:\n    print('parent alive', flush=True)\n    time.sleep(0.1)\n"
+    )
+    with pytest.raises(ToolchainError, match="time budget"):
+        run_command(["python3", "-c", script], label="tree", timeout=2.0)
+
+    grandchild = int(pid_file.read_text())
+    for _ in range(40):  # give the signal a moment to land
+        try:
+            os.kill(grandchild, 0)
+        except (ProcessLookupError, PermissionError):
+            break
+        time.sleep(0.25)
+    else:
+        os.kill(grandchild, 9)
+        pytest.fail(f"grandchild {grandchild} survived the timeout")

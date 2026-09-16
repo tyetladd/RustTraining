@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +26,8 @@ from voice_clone_tts.errors import VoiceCloneError
 log = logging.getLogger(__name__)
 
 TAIL_LINES = 40
+POLL_SECONDS = 0.5
+GRACE_SECONDS = 10.0
 
 
 class ToolchainError(VoiceCloneError):
@@ -56,6 +62,54 @@ def find_executable(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _terminate_tree(process: subprocess.Popen) -> None:
+    """Stop the process and everything it spawned.
+
+    Trainers launch their own worker processes (Applio runs ``core.py``, which
+    runs ``train.py``), so killing only the direct child would leave the real
+    job running on the GPU. The child is started in its own process group,
+    which makes the whole tree addressable.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        group = os.getpgid(process.pid)
+    except (AttributeError, OSError, ProcessLookupError):
+        group = None
+
+    def signal_all(sig: int) -> None:
+        if group is not None:
+            try:
+                os.killpg(group, sig)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            process.send_signal(sig)
+        except (OSError, ProcessLookupError, ValueError):
+            pass
+
+    signal_all(getattr(signal, "SIGTERM", signal.SIGINT))
+    try:
+        process.wait(timeout=GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        log.warning("process did not stop on SIGTERM, killing it")
+    signal_all(getattr(signal, "SIGKILL", signal.SIGTERM))
+    try:
+        process.wait(timeout=GRACE_SECONDS)
+    except subprocess.TimeoutExpired:  # pragma: no cover - should not happen
+        log.error("process %s survived SIGKILL", process.pid)
+
+
+def _stream_reader(stream, sink: "queue.Queue[str | None]") -> None:
+    try:
+        for line in stream:
+            sink.put(line)
+    finally:
+        sink.put(None)
+
+
 def run_command(
     args: Sequence[str],
     *,
@@ -65,7 +119,12 @@ def run_command(
     label: str = "",
     check: bool = True,
 ) -> CommandResult:
-    """Run `args`, streaming its output to the log at DEBUG level."""
+    """Run `args`, streaming its output to the log at DEBUG level.
+
+    `timeout` is a wall-clock budget for the whole command, enforced while the
+    output is being read — cloud sessions end on a hard limit, so a training
+    run has to be stopped in time for its checkpoints to be saved.
+    """
     args = [str(arg) for arg in args]
     label = label or Path(args[0]).name
     log.info("running %s: %s", label, " ".join(args))
@@ -81,23 +140,48 @@ def run_command(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,  # own process group, so the tree can be killed
         )
     except FileNotFoundError as exc:
         raise ToolchainError(f"{label}: command not found ({args[0]})") from exc
 
     assert process.stdout is not None
+    lines: "queue.Queue[str | None]" = queue.Queue()
+    reader = threading.Thread(target=_stream_reader, args=(process.stdout, lines), daemon=True)
+    reader.start()
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    finished = False
     try:
-        for line in process.stdout:
-            line = line.rstrip()
-            if line:
-                tail.append(line)
-                log.debug("[%s] %s", label, line)
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        raise ToolchainError(f"{label}: timed out after {timeout:.0f}s") from None
+        while not finished:
+            try:
+                line = lines.get(timeout=POLL_SECONDS)
+            except queue.Empty:
+                line = ""
+            else:
+                if line is None:
+                    finished = True
+                    line = ""
+            stripped = line.rstrip()
+            if stripped:
+                tail.append(stripped)
+                log.debug("[%s] %s", label, stripped)
+            if deadline is not None and time.monotonic() > deadline and not finished:
+                log.warning("%s: time budget of %.0fs is up, stopping it", label, timeout)
+                _terminate_tree(process)
+                raise ToolchainError(
+                    f"{label}: stopped after the {timeout:.0f}s time budget.\n"
+                    f"Last output:\n" + "\n".join(tail)
+                )
+        process.wait(timeout=GRACE_SECONDS)
     finally:
-        process.stdout.close()
+        reader.join(timeout=GRACE_SECONDS)
+        try:
+            process.stdout.close()
+        except Exception:  # noqa: BLE001 - already closed
+            pass
+        if process.poll() is None:
+            _terminate_tree(process)
 
     result = CommandResult(args=args, returncode=process.returncode, tail=list(tail))
     if check and not result.ok:
